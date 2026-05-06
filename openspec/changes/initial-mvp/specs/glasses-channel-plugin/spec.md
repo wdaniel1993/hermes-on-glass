@@ -1,57 +1,100 @@
 ## ADDED Requirements
 
-### Requirement: Plugin registers as a Hermes channel for the glasses
+### Requirement: Adapter registers as a Hermes channel by subclassing BasePlatformAdapter
 
-The glasses-channel-plugin SHALL be installable via Hermes' plugin discovery mechanism (`~/.hermes/plugins/glasses-channel/`) and SHALL register as a channel that Hermes' delivery layer (cron jobs, scheduled tasks, agent-initiated nudges) can target.
+The `hermes-channel-adapter` Python module SHALL be installable via Hermes' plugin discovery (`~/.hermes/plugins/hermes-channel-adapter/`) and SHALL register a channel named `glasses` by subclassing `gateway/platforms/base.py:BasePlatformAdapter` and implementing the abstract methods `connect`, `disconnect`, `send`, and `get_chat_info`.
 
-#### Scenario: Plugin install
+#### Scenario: Channel registration
 
-- **WHEN** the user installs the plugin into `~/.hermes/plugins/glasses-channel/` and restarts the Hermes gateway
-- **THEN** `hermes channels list` (or equivalent) shows `glasses` as an available delivery target
+- **WHEN** the user installs the adapter under `~/.hermes/plugins/hermes-channel-adapter/` and restarts the Hermes gateway
+- **THEN** Hermes' channel registry includes `glasses` as an available delivery target and `connect()` is called by the gateway lifecycle
 
 #### Scenario: Cron delivery
 
 - **WHEN** a Hermes cron job is configured with delivery target `glasses` and fires
-- **THEN** the plugin receives the message via the channel-adapter API and forwards it to the configured phone-app webhook
+- **THEN** the framework calls `send(chat_id, content, ...)` on the adapter and the adapter pushes a `push_message` frame on the active WebSocket session for that `chat_id`
 
-### Requirement: Plugin forwards messages to the phone-app via authenticated webhook
+### Requirement: Adapter hosts the WebSocket endpoint
 
-The plugin SHALL forward each Hermes-originated message as an HTTP POST to a user-configured phone-app webhook URL, including a shared-secret bearer token to authenticate the push.
+The adapter SHALL host a WebSocket endpoint that the phone-app connects to, accept upgrades only when the `Authorization: Bearer <SHARED_SECRET>` header matches the configured `shared_secret`, and reject all other upgrades with HTTP 401.
 
-#### Scenario: Successful forward
+#### Scenario: Authorized client
 
-- **WHEN** the plugin receives a message and the phone-app webhook returns 200
-- **THEN** the plugin marks the message as delivered and emits no retry
+- **WHEN** the phone-app initiates a WebSocket upgrade with a matching Bearer header
+- **THEN** the adapter completes the handshake, allocates a session for that `chat_id`, and emits a `server_welcome` frame containing the current session list
 
-#### Scenario: Webhook unreachable
+#### Scenario: Unauthorized client
 
-- **WHEN** the phone-app webhook returns a 5xx status or fails to connect
-- **THEN** the plugin retries with exponential backoff up to 3 attempts and then logs a delivery failure
+- **WHEN** any client initiates a WebSocket upgrade without or with an incorrect Bearer header
+- **THEN** the adapter responds 401 and does not allocate a session
 
-#### Scenario: Authentication
+### Requirement: Adapter dispatches inbound text and voice via handle_message
 
-- **WHEN** the plugin sends a forward
-- **THEN** the request carries an `Authorization: Bearer <plugin-shared-secret>` header
+The adapter SHALL convert inbound `user_message` frames into Hermes events and call `await self.handle_message(event)`. For `voice_note` frames, the adapter SHALL write the reassembled Opus bytes via `cache_audio_from_bytes(..., ext=".ogg")`, set `event.message_type = MessageType.VOICE` and `event.media_urls = [cached_path]`, then call `handle_message`. The adapter SHALL NOT transcribe inline — the agent loop calls the STT tool itself.
 
-### Requirement: Plugin payload schema preserves message origin and trigger
+#### Scenario: Text-only user message
 
-The plugin SHALL send a JSON body that distinguishes message origin (`cron-job`, `run-completion`, `agent-nudge`) and includes the originating session/conversation name and a stable message id.
+- **WHEN** the adapter receives a `user_message { id, text }` frame on the WebSocket
+- **THEN** the adapter constructs an event with `message_type = MessageType.TEXT`, `text = <text>`, and `chat_id` derived from the session, then awaits `handle_message(event)`
 
-#### Scenario: Cron-origin payload
+#### Scenario: Voice-only user message
 
-- **WHEN** a scheduled cron job triggers a delivery
-- **THEN** the forwarded payload includes `{ "origin": "cron-job", "jobId": "<id>", "conversation": "<name>", "messageId": "<uuid>", "text": "<rendered>" }`
+- **WHEN** the adapter receives a `voice_note` (single-shot or fully reassembled chunked) frame
+- **THEN** the adapter writes the Opus bytes via `cache_audio_from_bytes`, sets `event.message_type = MessageType.VOICE` and `event.media_urls = [cached_path]`, and awaits `handle_message(event)`
 
-#### Scenario: Run-completion payload
+#### Scenario: Image attachment
 
-- **WHEN** a long-running `/v1/runs` task completes and is configured to notify the glasses
-- **THEN** the forwarded payload includes `{ "origin": "run-completion", "runId": "<id>", "conversation": "<name>", "messageId": "<uuid>", "text": "<output>" }`
+- **WHEN** the adapter receives a `user_message` frame with `imageBase64` set
+- **THEN** the adapter materializes the image bytes to the cache, populates `event.media_urls` and `event.media_types` accordingly, and awaits `handle_message(event)`
 
-### Requirement: Plugin is configurable via a single YAML file
+### Requirement: Adapter pushes assistant output as channel-to-phone WS frames
 
-The plugin SHALL read its configuration from `~/.hermes/plugins/glasses-channel/config.yaml`, including `webhook_url`, `shared_secret`, and `default_conversation`.
+The adapter SHALL override `send`, `send_voice`, and `play_tts` (and override or wrap `edit_message` for streaming-style updates) to push outbound content as WebSocket frames to the phone-app for the relevant `chat_id`.
+
+#### Scenario: Text reply
+
+- **WHEN** the framework calls `await adapter.send(chat_id, content, reply_to, metadata)`
+- **THEN** the adapter emits an `assistant_chunk` frame (or a sequence of chunks if the framework provides streaming) followed by `assistant_complete { id }` on the WebSocket session matching `chat_id`
+
+#### Scenario: Auto-TTS voice reply
+
+- **WHEN** Hermes' shared response pipeline (`base.py:2792-2823`) renders a TTS file and calls `play_tts(chat_id, audio_path, ...)`
+- **THEN** the adapter reads the rendered Opus file and emits an `assistant_audio { id, bytesBase64 }` frame on the WebSocket session matching `chat_id`
+
+#### Scenario: Tool progress event
+
+- **WHEN** the framework or response pipeline emits a tool-call lifecycle event
+- **THEN** the adapter emits a `tool_progress { messageId, toolName, phase }` frame to the matching session
+
+### Requirement: Adapter exposes Hermes-initiated pushes with origin metadata
+
+The adapter SHALL convert Hermes-initiated deliveries (cron jobs, run completions, agent nudges) into `push_message` frames with the originating type encoded in the `origin` field.
+
+#### Scenario: Cron-origin push
+
+- **WHEN** a scheduled cron job triggers a delivery to `chat_id`
+- **THEN** the adapter emits `push_message { origin: "cron-job", jobId, conversation, messageId, text }` on the WebSocket session matching `chat_id`
+
+#### Scenario: Run-completion push
+
+- **WHEN** a long-running task completes and is configured to notify the channel
+- **THEN** the adapter emits `push_message { origin: "run-completion", runId, conversation, messageId, text }`
+
+#### Scenario: Agent-nudge push
+
+- **WHEN** the agent itself originates an unsolicited message to the channel
+- **THEN** the adapter emits `push_message { origin: "agent-nudge", conversation, messageId, text }`
+
+### Requirement: Adapter is configurable via a single YAML file
+
+The adapter SHALL read its configuration from `~/.hermes/plugins/hermes-channel-adapter/config.yaml`, including `listen_host`, `listen_port`, and `shared_secret`. Voice-pipeline configuration (`stt.provider`, `tts.provider`, `voice.auto_tts`) SHALL be inherited from Hermes' `~/.hermes/config.yaml` and not duplicated in the adapter config.
 
 #### Scenario: Missing config
 
-- **WHEN** the plugin loads with no config file
-- **THEN** the plugin logs a configuration error, does not register the channel, and the Hermes gateway continues to start
+- **WHEN** the adapter loads with no config file
+- **THEN** the adapter logs a configuration error, does not register the channel, and the Hermes gateway continues to start
+
+#### Scenario: Inherits voice settings
+
+- **WHEN** the user configures `tts.provider: edge` in `~/.hermes/config.yaml`
+- **THEN** the adapter renders TTS via Edge for glasses replies without any adapter-side TTS configuration

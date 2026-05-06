@@ -1,45 +1,65 @@
 ## ADDED Requirements
 
-### Requirement: Shared module defines Hermes wire DTOs for the Responses API subset
+### Requirement: Shared module defines phone↔channel WebSocket frame DTOs
 
-The `shared/` module SHALL define Kotlin data classes (with Gson `@SerializedName` annotations) representing the request body and SSE event subset of Hermes' `/v1/responses` API that the phone-app consumes.
+The `shared/` module SHALL define Kotlin data classes (with Gson `@SerializedName` annotations) representing every JSON frame exchanged on the WebSocket between the phone-app and the Hermes channel adapter, with a `type` discriminator field on each frame.
 
-#### Scenario: Request body shape
+#### Scenario: Phone-to-channel frames
 
-- **WHEN** the phone-app constructs a Responses API request
-- **THEN** the request DTO includes fields for `model`, `input` (string or content-part array), `conversation`, `instructions`, `stream`, and `previous_response_id`
+- **WHEN** the phone-app sends a frame to the channel adapter
+- **THEN** the frame's `type` is one of `client_hello`, `user_message`, `voice_note`, `image_attachment`, `switch_session`, `new_session`, `slash_command`, `display_state`, `pong`
 
-#### Scenario: SSE event taxonomy
+#### Scenario: Channel-to-phone frames
 
-- **WHEN** the phone-app parses a Hermes SSE event
-- **THEN** the parser recognizes `response.created`, `response.output_text.delta`, `response.output_item.added`, `response.output_item.done`, `response.completed`, and `hermes.tool.progress`, and emits an `Unknown` variant for any other event type without failing
+- **WHEN** the channel adapter sends a frame to the phone-app
+- **THEN** the frame's `type` is one of `server_welcome`, `assistant_chunk`, `assistant_complete`, `tool_progress`, `assistant_audio`, `push_message`, `session_list`, `connection_update`, `ping`
 
-#### Scenario: Multimodal content parts
+#### Scenario: User message frame carries text and optional media
 
-- **WHEN** the phone-app constructs an `input` array with both text and image
-- **THEN** the DTO supports a discriminated union of `input_text { text }` and `input_image { image_url }` content parts where `image_url` accepts both remote `http(s)://` URLs and `data:image/...;base64,...` URLs
+- **WHEN** the phone-app sends a `user_message` frame
+- **THEN** the frame includes `id` (client-side message id), `text`, optional `imageBase64` (≤256 KB JPEG), and optional `audioRef` (handle to a previously uploaded `voice_note`)
 
-### Requirement: Shared module defines phone↔glasses envelopes used by both apps
+#### Scenario: Voice note frame carries Opus bytes
 
-The `shared/` module SHALL define DTOs for every JSON envelope exchanged between the phone-app and the glasses-app, with a `type` discriminator field on each envelope.
+- **WHEN** the phone-app sends a `voice_note` frame
+- **THEN** the frame includes `id` and either `bytesBase64` (single-shot) or `streamId` + `seq` + `final` (chunked); the channel adapter reassembles and writes the bytes to the cache directory
+
+#### Scenario: Assistant chunk carries incremental text
+
+- **WHEN** the channel adapter sends an `assistant_chunk` frame
+- **THEN** the frame includes `id` (parent assistant message id) and `chunk` (a single token-or-string delta), and consumers SHALL append rather than replace
+
+#### Scenario: Assistant audio frame carries rendered TTS
+
+- **WHEN** the channel adapter sends an `assistant_audio` frame
+- **THEN** the frame includes `id` (parent assistant message id) and `bytesBase64` of the rendered Opus file
+
+#### Scenario: Push message preserves origin
+
+- **WHEN** the channel adapter sends a `push_message` frame for a Hermes-initiated push
+- **THEN** the frame includes `origin` ∈ {`cron-job`, `run-completion`, `agent-nudge`}, the originating `conversation`, a stable `messageId`, and the rendered `text`
+
+### Requirement: Shared module defines phone↔glasses Bluetooth envelopes
+
+The `shared/` module SHALL define DTOs for every JSON envelope exchanged between the phone-app (CXR-M) and the glasses-app (CXR-S) over Caps, with a `type` discriminator field on each envelope.
 
 #### Scenario: Phone-to-glasses envelopes
 
 - **WHEN** the phone-app sends an envelope to the glasses
-- **THEN** the envelope is one of `chat_message`, `agent_thinking`, `chat_stream`, `chat_stream_end`, `tool_progress`, `connection_update`, `session_list`, `voice_state`, `voice_result`, `wake_signal`, `tts_state`
+- **THEN** the envelope's `type` is one of `chat_message`, `agent_thinking`, `chat_stream`, `chat_stream_end`, `tool_progress`, `connection_update`, `session_list`, `wake_signal`, `voice_play` (carries an Opus audio reference for `MediaPlayer`)
 
 #### Scenario: Glasses-to-phone envelopes
 
 - **WHEN** the glasses-app sends an envelope to the phone
-- **THEN** the envelope is one of `user_input`, `list_sessions`, `switch_session`, `slash_command`, `start_voice`, `cancel_voice`, `wake_ack`, `tts_toggle`, `request_more_history`
+- **THEN** the envelope's `type` is one of `user_input`, `voice_capture` (carries an Opus stream id), `list_sessions`, `switch_session`, `slash_command`, `display_state`, `wake_ack`, `request_more_history`
 
-### Requirement: Shared module provides a frame-parsing entry point
+### Requirement: Shared module provides a single frame-parsing entry point
 
 The `shared/` module SHALL expose a single function that takes a JSON string and returns either a typed envelope object or null when the frame is not recognized.
 
 #### Scenario: Recognized frame
 
-- **WHEN** `parseFrame(json)` is called with a string whose `type` field matches a known envelope
+- **WHEN** `parseFrame(json)` is called with a string whose `type` field matches a known envelope or WS frame
 - **THEN** the function returns the corresponding typed object
 
 #### Scenario: Malformed frame
@@ -47,20 +67,39 @@ The `shared/` module SHALL expose a single function that takes a JSON string and
 - **WHEN** `parseFrame(json)` is called with a string that is not valid JSON or has no `type` field
 - **THEN** the function returns null and does not throw
 
+#### Scenario: Unknown type tolerated
+
+- **WHEN** `parseFrame(json)` is called with a well-formed JSON whose `type` is not recognized (e.g., a future frame type)
+- **THEN** the function returns null and the caller logs and ignores the frame
+
 ### Requirement: Streaming envelopes carry incremental chunks, not accumulated text
 
-The `chat_stream` envelope SHALL carry a single incremental token chunk in its `chunk` field, and consumers SHALL append rather than replace.
+The phone↔glasses `chat_stream` envelope and the phone↔channel `assistant_chunk` frame SHALL carry a single incremental token chunk in their `chunk` field; consumers SHALL append rather than replace.
 
 #### Scenario: Incremental append semantics
 
-- **WHEN** the glasses-app receives two `chat_stream { id: "r1", chunk: "Hello " }` and `chat_stream { id: "r1", chunk: "world" }` envelopes in order
+- **WHEN** the glasses-app receives `chat_stream { id: "r1", chunk: "Hello " }` followed by `chat_stream { id: "r1", chunk: "world" }`
 - **THEN** the rendered message with id `r1` reads "Hello world"
 
-### Requirement: Tool-progress envelopes carry the message id and a phase
+### Requirement: Tool-progress frames carry message id and phase
 
-The `tool_progress` envelope SHALL carry `messageId` (matching the streaming response id), `toolName`, and `phase` ∈ {`started`, `finished`}.
+The `tool_progress` WS frame and the `tool_progress` phone↔glasses envelope SHALL carry `messageId` (matching the streaming response id), `toolName`, and `phase` ∈ {`started`, `finished`}.
 
-#### Scenario: Progress envelope round-trip
+#### Scenario: Progress frame round-trip
 
-- **WHEN** the phone-app constructs a `tool_progress` envelope from a `hermes.tool.progress` SSE event
-- **THEN** the envelope's `messageId` equals the parent response id, `toolName` equals the SSE event's tool name field, and `phase` equals one of the two enumerated values
+- **WHEN** the channel adapter emits a `tool_progress` frame in response to a Hermes tool-call event
+- **THEN** the frame's `messageId` equals the parent assistant message id, `toolName` is the tool's name, and `phase` is one of the two enumerated values
+
+### Requirement: WebSocket auth uses a shared secret on the upgrade request
+
+The phone-app SHALL include `Authorization: Bearer <SHARED_SECRET>` on the WebSocket upgrade request; the channel adapter SHALL reject upgrades whose header does not match the configured `shared_secret`.
+
+#### Scenario: Authorized upgrade
+
+- **WHEN** the phone-app initiates a WebSocket upgrade with a matching Bearer header
+- **THEN** the channel adapter completes the handshake and emits a `server_welcome` frame
+
+#### Scenario: Missing or wrong secret
+
+- **WHEN** the phone-app initiates a WebSocket upgrade with a missing or incorrect Bearer header
+- **THEN** the channel adapter rejects the upgrade with HTTP 401 and does not allocate a session

@@ -1,176 +1,214 @@
 ## Context
 
-The reference architecture is `dweddepohl/clawsses` — an Android phone-app + Rokid glasses-app pair that bridges Rokid Glasses to OpenClaw via WebSocket. We are inspired by it (same module shape, same phone-as-bridge topology, similar HUD UX) but writing fresh code that targets Hermes Agent's REST API instead of OpenClaw's WebSocket gateway.
+The reference architecture is `dweddepohl/clawsses` — an Android phone-app + Rokid glasses-app pair that bridges Rokid Glasses to OpenClaw via WebSocket. We are inspired by the module shape and HUD UX but writing fresh code that targets Hermes Agent's channel-adapter surface (`gateway/platforms/`), not OpenClaw.
 
-Hermes' API surface (verified 2026-05-06 against `https://hermes-agent.nousresearch.com/docs`):
+### Hermes Agent surface (verified 2026-05-06 against repo + voice-mode docs)
 
-- Gateway runs on `127.0.0.1:8642` by default; configurable bind address via `API_SERVER_KEY` env var.
-- Auth is Bearer token; warning in docs: "The API server gives full access to hermes-agent's toolset, including terminal commands."
-- `POST /v1/responses` with `conversation: <name>` parameter chains turns server-side, persisted in SQLite, **LRU-evicts beyond 100 stored responses**.
-- `POST /v1/chat/completions` is the OpenAI-compatible alternative (no server-side state).
-- SSE streaming on both endpoints. `/v1/responses` emits `response.created`, `response.output_text.delta`, `response.output_item.added`, `response.output_item.done`, `response.completed`, plus custom `hermes.tool.progress`.
-- `image_url` in message content accepts `http(s)://` URLs and `data:image/...;base64,...`. Uploaded files / `file_id` / non-image data: URLs return 400.
-- **No audio input**. Voice mode is bound to CLI / Telegram / Discord channels — not exposed via the API server.
-- `/api/jobs` exposes scheduled work that delivers to any registered channel.
-- Plugin discovery from `~/.hermes/plugins/`, `.hermes/plugins/`, or pip entry points. Channels live under `gateway/platforms/`. Plugin extension surface for *custom channels* (vs. tools) is documented thinly — needs verification before MVP+1.
+- **Channel adapters** live in `gateway/platforms/`. Base class: `BasePlatformAdapter` (`gateway/platforms/base.py:1206`). Required overrides: `connect()`, `disconnect()`, `send(chat_id, content, reply_to, metadata)`, `get_chat_info(chat_id)`. Helpers: `edit_message`, `delete_message`, `send_typing`, `send_image`, `send_voice`, `play_tts`, `send_animation`, `send_document`, `send_video` (all `base.py:1453-2140`). Lifecycle hooks: `on_processing_start` / `on_processing_complete`.
+- **Inbound dispatch**: adapters call `await self.handle_message(event)` (`base.py:2543`). The framework spawns one async task per session_key; bypass commands (`/stop`, `/new`, `/reset`, `/approve`, `/deny`) are routed inline.
+- **Voice is shared, not per-channel.** STT lives in `tools/transcription_tools.py` (default provider `local` = faster-whisper, no API key required; alternates: `groq`, `openai`). TTS lives in `tools/tts_tool.py` (default provider `edge` = Microsoft Edge neural TTS, free; alternates: `elevenlabs`, `openai`, `mistral`, `xai`, etc.). Both invoked from the shared response pipeline at `base.py:2792-2823`.
+- **Telegram pattern (the model for our adapter):**
+  1. On inbound voice memo, the adapter downloads bytes, calls `cache_audio_from_bytes(bytes(audio_bytes), ext=".ogg")` (`telegram.py:3192-3202`), sets `event.message_type = MessageType.VOICE` and `event.media_urls = [cached_path]`, and calls `handle_message(event)`.
+  2. Adapter does *not* transcribe inline — the agent (model loop) calls the STT tool when it sees an audio media URL.
+  3. On reply, `base.py:2792-2823` checks `_should_auto_tts_for_chat(chat_id)` and `event.message_type == VOICE`; if both true, calls `text_to_speech_tool` and then `play_tts`. The adapter overrides `send_voice` / `play_tts` to upload the rendered file to its native channel.
+  4. `/voice on` / `/voice off` / `voice_only` / `all` user commands implemented in `base.py:1284-1297`. We get them for free.
+- **No streaming TTS to channels** today. Each TTS provider in `tts_tool.py` writes a complete file before returning. We accept this as MVP cost; protocol leaves room for future streaming.
+- **Webhook adapter is ingress-only** (`gateway/platforms/webhook.py`). Outbound delivery there re-routes through *another* adapter — webhooks are not a clean template for a bidirectional phone bridge. Our model is `discord.py` / `matrix.py` (persistent socket).
+- **WS server hosting**: `webhook.py` binds routes via `aiohttp` `app.router.add_post(...)` on `0.0.0.0:8644`, demonstrating that adapters can bind on the gateway's HTTP app. We expect the same plumbing to be available for `app.router.add_get(...)` with WebSocket upgrade — confirmed in spike OQ4.
 
-Topology constraints from the user:
+### Rokid SDK surface (verified against `buildwithfenna/rokid-docs`)
 
-- Hermes runs on a Mac mini at home. Reachable from the phone over Tailscale via MagicDNS hostname `mac` (so the phone-app's base URL is `http://mac:8642`).
-- The glasses are Rokid Glasses (480×640 monochrome green micro-LED, JBD 0.13" panel, dual-eye, on-board AOSP). They reach the phone over Bluetooth via Rokid's CXR-M (phone) / CXR-S (glasses) SDKs.
-- The phone runs Termux only as a connectivity convenience for the user's own SSH/shell access — the Android *app* itself does not depend on Termux. Bearer token auth is what protects Hermes; Tailscale provides the network boundary.
+- **Three SDK trees:**
+  - `cxr-m/` — phone-side (used by `phone-app`).
+  - `cxr-s/` — on-glasses bridge (used by `glasses-app` for the wire to the phone). Exposes `CXRServiceBridge.subscribe(name, MsgCallback | MsgReplyCallback)` with optional request/reply via `Reply.end(Caps)` (`cxr-s/message-subscription.md`).
+  - `cxr-l/` — glasses-native AIDL bridge to `com.rokid.sprite.aiapp`'s `IMediaStreamService`. APIs: `takePhoto(width, height, quality)` with `IImageStreamCbk.onImageReceived(byte[])`, `startAudioStream(codecType)` with `IAudioStreamCbk.onAudioReceived(byte[], sampleRate, channels)`, `openCustomView(json)`, `updateCustomView(...)`, `setIcons(json)`, `closeCustomView`. `AuthorizationHelper` requires the Rokid AI app installed (versionCode ≥ 100000) (`cxr-l/api-reference.md:247-252`).
+- **Caps is binary**, supports nested `byte[]` and structured payloads (`cxr-s/data-structure.md`). MTU is configured per client type in `cxr-service.json` (Android-RFCOMM / iOS-GATT / iOS-MFI). The 500-char truncation in clawsses' `RokidSdkManager.kt:600` is a clawsses convention, not a Rokid SDK limit.
+- **Bulk transport**: `sendStream(CxrStreamType, byte[], fileName, cb)` for streaming bytes (`cxr-m/sdk-decompiled-reference.md`); `setAudioStreamListener(...)` delivers `onAudioStream(byte[], offset, length)` chunks; ARTC has a dedicated `onARTCFrame(byte[], long ts)` channel.
+- **APK push**: `CxrApi.startUploadApk(wifiAddress, callback)` (`sdk-decompiled-reference.md:1007-1017`) does Wi-Fi P2P + multipart POST to `http://<glasses_ip>:8848`. **Critical bug**: WiFi-P2P stale-status, workaround via reflection on hidden `WifiP2pManager.deletePersistentGroup` (`sdk-decompiled-reference.md:817-893`).
+- **Pairing / SN verification** (`sdk-decompiled-reference.md:2168-2192`): `connectBluetooth()` reconnect requires `snEncryptContent: byte[]` and `clientSecret: String`; AES/CBC/PKCS5Padding with key = clientSecret bytes (dashes stripped), IV = first 16 bytes of clientSecret bytes. First-connection `initBluetooth()` skips SN check.
+- **Audio**: 4 built-in mics (16-bit/16 kHz, accessible via standard `AudioSource.MIC`); earpiece + stereo speaker (48 kHz PCM). Wake-word/AEC runs on a separate NXP RT600 co-processor (`yodaos/docs/hardware/audio.md`). For our MVP we use standard Android `MediaRecorder` (Opus encoder, API 29+) and `MediaPlayer` on the glasses; we do **not** wire the on-board KWS pipeline.
+- **Display**: 480×640 software canvas (always downscaled to this size regardless of mode, per `screen-record.md:333`). Refresh thermally throttled across 60-180 Hz. Brightness 0-15. Screen sleep coordinated via `setScreenOffTimeout(ms)`, `notifyGlassScreenOff()`, and `ScreenStatusUpdateListener.onScreenStatusUpdated(boolean)`. JBD JBD4020 micro-LED is right-eye only; the docs do **not** assert the panel is monochrome green — that is panel-vendor lore from outside the docs, so we hedge in the spec text.
+- **Touchpad**: capacitive sensor on the right temple (`yodaos/docs/kernel/modules.md:93`), surfaced as standard Android `KeyEvent`s (DPAD_LEFT/RIGHT/UP/DOWN/CENTER, BACK, KEYCODE_CAMERA, KEYCODE_VOLUME_UP/DOWN per `apps/camera2.md:327-337`). No documented gesture taxonomy beyond key events.
+- **App constraints**: minSdk ≥ 28, arm64-v8a. targetSdk ≤ 32 confirmed safe (CXR-S is built against 28).
+
+### Topology constraints from the user
+
+- Hermes runs on a Mac mini at home. Reachable from the phone over Tailscale via MagicDNS hostname `mac`.
+- Glasses are Rokid Glasses — Android-based AOSP, on-board mics, speakers, camera, capacitive touchpad on right temple.
+- Phone runs Termux only as a connectivity convenience for the user's own SSH/shell access — the Android *app* itself does not depend on Termux.
 
 ## Goals / Non-Goals
 
 **Goals:**
 
-- Build a wearable Hermes client that mirrors the clawsses UX (long-press-to-talk, streaming HUD, session picker, photo-attached questions, TTS playback) without copying clawsses code.
-- Use Hermes' `/v1/responses` server-side conversation state to drastically simplify session management vs. clawsses' OpenClaw lifecycle.
-- Render incremental Hermes deltas natively as glasses chat-stream chunks (no client-side diffing).
-- Surface Hermes tool-progress events in the HUD so the user knows when the agent is mid-tool-call.
-- Land MVP+1 (`glasses-channel-plugin`) so Hermes can push to the glasses without the user prompting first — the moment that distinguishes this from "wearable LLM client."
+- Build a wearable Hermes client where the glasses-and-phone pair is a *single Hermes channel*, not a custom REST client.
+- Mirror Telegram's voice pattern: glasses captures Opus, server-side STT, server-side TTS, glasses plays the result. No phone-side audio engine.
+- Phone-app participates in the chat (history view, typed input from the phone) — not a transparent bridge.
+- Surface incremental Hermes deltas as glasses chat-stream chunks; render `hermes.tool.progress` as a HUD subline.
 
 **Non-Goals:**
 
-- No audio I/O via Hermes' REST. Voice stays phone-local (Path A from /opsx:explore). Revisit when Hermes ships a first-class audio API or once our channel plugin can route audio.
-- No Discord/Telegram/Slack mirroring on the glasses. Hermes already has those; we are *another* channel, not a replacement.
-- No fork or vendoring of clawsses code. Architectural inspiration only.
+- No `/v1/responses` REST client on the phone.
+- No phone-side STT/TTS (no `SpeechRecognizer`, no Edge/ElevenLabs on Android). The phone is not a voice device.
+- No webhook-based push from Hermes to the phone (would require the phone to host an inbound HTTP server — brittle on Doze/OEM-killers).
+- No Discord/Telegram/Slack mirroring on the glasses (those are independent Hermes channels).
 - No public-internet exposure of Hermes. Tailscale or LAN only.
-- No iOS, Vision Pro, Meta Quest, XReal, or other AR vendors.
-- No on-device LLM. Glasses thermal/battery budget makes this a bad MVP choice; the agent runs on the Mac mini.
-- No replacement for Hermes' memory/skills/jobs systems. We use them; we do not duplicate them.
+- No fork or vendoring of clawsses code.
+- No on-device LLM. Glasses thermal/battery budget makes this a bad MVP choice.
+- No use of Rokid's on-board KWS / wake-word pipeline. Long-press-to-talk only.
+- No SLAM, no eye tracking — neither is exposed by the Rokid SDK.
 
 ## Decisions
 
-### D1: Use `/v1/responses` (Responses API) over `/v1/chat/completions`
+### D1: Glasses-and-phone pair is a single Hermes channel
 
-**Choice:** Phone-app's HermesClient sends `POST /v1/responses` with `model: "hermes-agent"`, `input`, `conversation: <session-name>`, `stream: true`.
+**Choice:** Ship a Python `BasePlatformAdapter` subclass (`hermes-channel-adapter/`) that registers a channel named `glasses`. All chat traffic — user→agent, agent→user, cron pushes, run-completions, agent-nudges — flows through this one adapter.
 
-**Rationale:** The `conversation` parameter gives us server-side multi-turn state without us tracking response IDs or replaying history. The Responses API SSE event taxonomy (`response.output_text.delta`, `response.output_item.added`, etc.) is also more expressive than chat completions chunks and includes the lifecycle hooks (`response.created`, `response.completed`) we want for HUD state transitions.
+**Rationale:** Idiomatic to Hermes (`gateway/platforms/` already hosts ~20 channels). Single source of truth for sessions and voice. Cron/run/nudge pushes share the same delivery path as user-driven turns; no second transport.
 
-**Alternatives considered:**
+**Alternatives considered:** REST client calling `/v1/responses` (rejected — splits push and pull paths, requires reproducing session management, doesn't compose with cron); MCP (rejected — wrong abstraction; MCP is for tools, not channels).
 
-- *Chat Completions API*: OpenAI-compatible, simpler, more stable. Rejected because we'd have to re-send full message history every turn, which fights the spirit of using Hermes' built-in memory and ages poorly as conversations grow.
-- *`/v1/runs` API*: Designed for long-running background work — overkill for interactive chat. We may use it later for fire-and-forget commands triggered from the glasses (e.g., "summarize my inbox"), but not for the MVP chat loop.
+### D2: WebSocket transport, outbound from phone, Bearer-on-upgrade
 
-### D2: Named conversations are the unit of session
+**Choice:** Phone connects outbound to `ws://mac:<port>/glasses` over Tailscale, with `Authorization: Bearer <SHARED_SECRET>` on the upgrade request. Persistent connection, JSON frames type-discriminated by a `type` field, our own envelope (not OpenAI Responses API events).
 
-**Choice:** A "session" on the glasses maps 1:1 to a named Hermes conversation passed via the `conversation` parameter. The phone-app maintains the canonical list of conversation names in local SQLite/SharedPreferences. Default conversation name on first run: `glasses-default`.
+**Rationale:** Bidirectional, full-duplex; phone doesn't host an inbound HTTP server (Tailscale-on-Android can in principle but Doze + OEM battery-killers make it brittle for "ship to friends" reliability); matches the `discord.py` / `matrix.py` adapter pattern (persistent socket). Tailscale's WireGuard tunnel is already encrypted; Bearer-on-upgrade is sufficient defense-in-depth.
 
-**Rationale:** Hermes LRU-evicts beyond 100 stored responses; we cannot trust the server as the source of truth for "list of sessions ever created." Phone-side authority also matches clawsses' UX where the session list is curated client-side.
+**Alternatives considered:** Webhook (rejected — `webhook.py` is ingress-only and inbound-Android-HTTP brittle); HTTP+SSE (one-way, would need a second channel for upstream — strictly worse than WS); gRPC streaming (overkill, generates code we don't need).
 
-**Alternatives considered:**
+### D3: Voice on the server (Telegram pattern), no phone-side STT/TTS
 
-- *Single global conversation*: Simpler, but the user explicitly wants a session picker.
-- *Server-side list via `/v1/runs` history*: Possible but undocumented behavior under LRU eviction; client-side list is unambiguous.
+**Choice:** Long-press-to-talk records Opus on the glasses. Bytes flow glasses → phone (CXR `sendStream` or `startAudioStream`) → WS → channel adapter. Adapter writes bytes via `cache_audio_from_bytes(..., ext=".ogg")`, sets `event.message_type = MessageType.VOICE` and `event.media_urls = [path]`, calls `handle_message`. The agent loop runs the STT tool itself. On reply, `base.py:2792-2823` invokes `text_to_speech_tool`; our adapter overrides `send_voice` / `play_tts` to push the rendered Opus down the WS to the phone, which forwards it via CXR to the glasses, which plays it via the local 48 kHz speaker. Phone never touches PCM.
 
-### D3: Voice stays on the phone (Path A)
+**Rationale:** Voice handling is a shared service in Hermes — `tools/tts_tool.py` and `tools/transcription_tools.py` are called from `base.py`, not per-channel. Telegram's adapter does only two things: download audio to cache and override `send_voice`/`play_tts`. We do exactly the same. Wins: consistent voice across all Hermes channels (same voice on glasses, Telegram, Discord); single config surface (`~/.hermes/config.yaml`); zero TTS/STT keys on the Android side; `/voice on/off` plus the `voice_only` / `all` modes for free; STT default = local faster-whisper (no API keys required at all).
 
-**Choice:** Android `SpeechRecognizer` for STT (with optional Google Cloud Speech fallback), ElevenLabs SDK or Edge TTS for output. The text round-trip with Hermes is the only thing that crosses the network.
+**Costs accepted:** ~1-2s STT lag after release-to-send (no live partial transcription) — acceptable for hold-to-talk with a recording overlay. TTS is render-then-play (no streaming TTS to channels yet) — long replies wait for full render. Mitigation deferred; protocol leaves frame headroom for streaming chunks.
 
-**Rationale:** Hermes' REST does not accept audio. The two alternatives — sidecar Whisper service on Mac mini, or a Telegram-bridge hack — add latency, deployment surface, or fragility. Phone-local STT/TTS ships now and gives sub-second latency on-device.
+**No fallback to phone-side voice.** A phone-local STT/TTS path would share the WebSocket failure mode (no server → no agent → nothing to transcribe *for* and no reply *to* speak); it would be theater. If the WS is down, voice is down. Acceptable.
 
-**Alternatives considered:**
+**Alternatives considered:** Phone-local STT + phone-local TTS (rejected — inconsistent voice across channels, key duplication, defeats the channel-unification thesis); phone-local STT only with server TTS (rejected — phone still maintains an STT engine just to lose live partial-results UX once it goes server-side anyway).
 
-- *Sidecar STT/TTS on Mac mini*: Better voice consistency across Hermes channels. Deferred — the network module is designed so audio-leg can move to Mac later without touching glasses or Hermes integration.
-- *Custom Hermes channel-plugin that accepts audio*: Real Python work and the plugin-extension surface for channels is sparsely documented. Deferred to a later proposal.
+### D4: Hermes owns sessions, not the phone
 
-### D4: Tailscale + Bearer, no public TLS
+**Choice:** No client-side session list, no `glasses-default` bookkeeping. Sessions are managed by Hermes (its native session model in the channel framework). The channel adapter exposes the session list over the WS via a `session_list` frame; the glasses session picker and the phone chat UI render whatever the adapter sends.
 
-**Choice:** Phone-app's HermesClient connects to `http://mac:8642` (MagicDNS over Tailscale) with the Bearer header `Authorization: Bearer <API_SERVER_KEY>`. No HTTPS/TLS terminator on the Hermes side.
+**Rationale:** Once we are a real channel, Hermes already maintains chat sessions per `chat_id`. The earlier draft's "phone-app maintains canonical list to work around 100-response LRU" was a workaround for `/v1/responses`; that workaround becomes obsolete once we're a channel. The 100-response LRU concern only applied to the Responses API.
 
-**Rationale:** Tailscale's WireGuard tunnel is end-to-end encrypted; layering TLS on top is redundant and adds cert-rotation pain. Bearer auth alone is acceptable *only because* the network path is restricted to the tailnet. The API key still functions as a defense-in-depth secret if a tailnet device is compromised.
+**Alternatives considered:** Phone-side session list (rejected — duplicates Hermes' state).
 
-**Risks:** If the user later wants to reach Hermes from outside the tailnet, this decision must be revisited (add Caddy/Tailscale Funnel + TLS).
+### D5: Phone is a participating chat client, not a transparent bridge
 
-### D5: Stream Hermes deltas through unchanged; no client-side accumulation
+**Choice:** Phone-app shows the active conversation's chat history in a Compose UI, has a typed-input affordance, and reflects the same conversation the glasses see. Mirrors `clawsses MainScreen.kt:603,765-789`. Both surfaces (phone UI + glasses HUD) are views of one Hermes session.
 
-**Choice:** Phone-app forwards each `response.output_text.delta` event directly into a phone→glasses `chat_stream { id, chunk }` envelope. Glasses appends. On `response.completed`, phone sends `chat_stream_end { id }`.
+**Rationale:** User-stated requirement. Useful for debugging (look at the phone when the HUD looks wrong) and for soft-fallback UX when the glasses are off or unreachable.
 
-**Rationale:** Hermes deltas are already incremental, so we skip the OpenClaw-style "full accumulated text + diff" logic. This is strictly simpler than clawsses' code path.
+**Alternatives considered:** Phone-as-bridge-only (rejected — user's intent is explicit on this).
 
-### D6: Tool-progress as a HUD subline
+### D6: Glasses-app uses CXR-S + CXR-L
 
-**Choice:** Phone forwards `hermes.tool.progress` events as a new envelope type `tool_progress { messageId, toolName, phase }` (phase ∈ `started`/`finished`). Glasses renders a single subline under the streaming message ("⚙ web_search…") that disappears on `finished` or when stream ends.
+**Choice:** Glasses-app depends on both `cxr-s` (bidirectional message wire to the phone via `CXRServiceBridge.subscribe(name, MsgCallback | MsgReplyCallback)`) and `cxr-l` (camera, audio, structured view APIs from `IMediaStreamService`). Phone-app depends on `cxr-m` only.
 
-**Rationale:** Hermes' tool calls can take seconds; without a visual signal the HUD just sits silent. This is a small, Hermes-specific differentiator.
+**Rationale:** CXR-S handles RPC framing including `MsgReplyCallback` (`cxr-s/message-subscription.md`), giving us request/reply semantics over Caps that `sendCustomCmd` doesn't offer. CXR-L is the documented surface for camera (`takePhoto(width, height, quality)`), audio I/O (`startAudioStream(codecType)`), and structured HUD push (`openCustomView(json)`). The earlier draft only listed CXR-S; that omitted the media APIs we need.
 
-### D7: Glasses session picker shows phone-managed conversation list
+**Alternatives considered:** CXR-S only with custom CameraX + standard `MediaRecorder` (rejected — `takePhoto` is documented and integrates with Rokid's camera lifecycle; bypassing it risks pipeline conflicts).
 
-**Choice:** Phone sends `session_list { sessions: [...], currentSessionKey }` whenever the user opens the picker or after creating a new conversation. Selection sends `switch_session { sessionKey }` from glasses → phone. Phone updates `conversation` parameter on subsequent `/v1/responses` calls. New-session creation is glasses-initiated via a menu entry (`+ New session`) that auto-names (`glasses-<timestamp>`) and the user can rename later from the phone settings.
+### D7: Caps + sendStream, no 500-char chunking
 
-**Rationale:** Matches clawsses' UX, fits the user's stated need for a picker, keeps the glasses code dumb.
+**Choice:** Use Caps (binary) directly for control frames over `CXRServiceBridge`. Use `sendStream(CxrStreamType, byte[], fileName, cb)` for bulk media (Opus audio, JPEG images). No artificial size cap on Caps frames; chunk only if a probe reveals a real MTU limit.
 
-### D8: Camera capture as data: URL `image_url` content part
+**Rationale:** The 500-char truncation in `RokidSdkManager.kt:600` is a clawsses-imposed convention, not a Rokid SDK limit. Caps natively supports binary and nested `byte[]`. `sendStream` is the documented bulk path. Truncating control frames at 500 chars would silently drop streaming chunks past the cap.
 
-**Choice:** Glasses captures JPEG, sends `user_input { text, imageBase64 }` to phone. Phone constructs:
+**Risks:** If a real per-frame limit exists (e.g., RFCOMM MTU values in `cxr-service.json` we couldn't inspect), some control frames could fail. Mitigation: probe early in task 6.x and add fragmenting only if needed.
 
-```json
-{ "role": "user", "content": [
-    { "type": "input_text", "text": "<text>" },
-    { "type": "input_image", "image_url": "data:image/jpeg;base64,<b64>" }
-] }
-```
+### D8: Streaming text deltas through unchanged
 
-(Exact field names match Responses API content-parts schema; verify on first integration.) Image is downscaled on the glasses before base64 to keep wire size sane on Bluetooth (target: ≤256 KB after JPEG, ≤350 KB after base64).
+**Choice:** Phone forwards each `assistant_chunk { id, chunk, parentId }` WS frame from the channel into a phone→glasses `chat_stream { id, chunk }` envelope. Glasses appends. On `assistant_complete { id }` from the channel, phone sends `chat_stream_end { id }`.
 
-**Rationale:** Hermes accepts data: URLs; uploading files is rejected. Downscaling on the glasses (vs. on the phone) saves Bluetooth bandwidth.
+**Rationale:** Same as the previous draft's D5 — Hermes deltas are already incremental, and it remains true through the channel-adapter wrap. Whether `BasePlatformAdapter` exposes per-token streaming hooks for *outbound* delivery is the open question (OQ2); if it doesn't, the adapter coalesces and uses `edit_message` for visible progress, while keeping the `chat_stream` envelope semantics on the phone↔glasses wire.
 
-### D9: Wake-on-message preserved with new `cron_message` reason
+### D9: Tool-progress as a HUD subline (unchanged)
 
-**Choice:** Phone-app subscribes to incoming pushes from `glasses-channel-plugin` (MVP+1) over an authenticated webhook (POST to a phone-local HTTP server, or — more realistically — via long-poll/SSE from the plugin). When a push arrives and the glasses display is asleep, phone sends `wake_signal { reason: "cron_message" }` first, waits for `wake_ack`, then delivers the buffered message.
+**Choice:** Adapter forwards `hermes.tool.progress` events as `tool_progress { messageId, toolName, phase }` WS frames. Phone re-emits as a phone→glasses envelope of the same shape. HUD renders a single subline ("⚙ web_search…") under the streaming message.
 
-**Rationale:** Reuses the wake-on-message pattern verbatim from clawsses' design. The plugin-driven push path is what makes scheduled-job glasses notifications work.
+### D10: Camera capture as image content-part
 
-### D10: Three Gradle modules + one Python module
+**Choice:** Glasses captures JPEG via CXR-L `takePhoto(width, height, quality)`; downscales until JPEG ≤ 256 KB; sends `user_input { text, imageBase64 }` to phone over CXR. Phone constructs a multimodal `user_message` WS frame whose payload includes both the text part and the image as a `data:image/jpeg;base64,...` URL. Channel adapter receives the frame and synthesizes an inbound `event` with the appropriate `media_urls` / multimodal content for `handle_message`.
+
+**Rationale:** Hermes' multimodal pipeline accepts data: URLs and uploaded files cached locally. The channel adapter does the format mapping; we don't expose Hermes' content-part schema on the WS wire.
+
+### D11: Wake-on-message preserved, with channel-origin metadata
+
+**Choice:** Adapter tags pushed messages with `origin ∈ {cron-job, run-completion, agent-nudge}` in the frame metadata. Phone routes through `WakeSignalManager` before delivery; sends `wake_signal { reason }` to the glasses; waits for `wake_ack` (or 3s timeout); then delivers. Display state coordinated via CXR `notifyGlassScreenOff()` and `ScreenStatusUpdateListener.onScreenStatusUpdated`.
+
+**Rationale:** Same UX as the previous draft, now natively driven by the channel rather than a separate webhook delivery target.
+
+### D12: Touchpad gestures consume Android KeyEvents, not raw touch
+
+**Choice:** Glasses-app listens for `KeyEvent`s (DPAD_LEFT/RIGHT/UP/DOWN/CENTER, BACK, KEYCODE_CAMERA, KEYCODE_VOLUME_UP/DOWN) per the Rokid touchpad's documented behavior. Long-press-to-talk = long DPAD_CENTER. No raw `MotionEvent` parsing.
+
+**Rationale:** `buildwithfenna/rokid-docs` documents only KeyEvent surfacing for the right-temple capacitive sensor; there is no documented gesture taxonomy beyond key codes.
+
+### D13: APK sideload via documented `startUploadApk`
+
+**Choice:** Phone-app bundles the glasses APK at build time and sideloads it on first launch via `CxrApi.startUploadApk(wifiAddress, ApkStatusCallback)`. This wraps Wi-Fi P2P discovery, multipart upload to `http://<glasses_ip>:8848`, install, and `openApp`.
+
+**Rationale:** Documented Rokid API; same pattern clawsses uses but officially on-spec. Includes the WiFi-P2P stale-status workaround Rokid documents (reflection on `WifiP2pManager.deletePersistentGroup`).
+
+### D14: Module layout — three Gradle + one Python
 
 **Choice:**
 
 ```
 hermes-on-glass/
 ├── shared/                    # Kotlin: protocol DTOs (both wires)
-├── phone-app/                 # Android Kotlin: bridge + voice + Hermes client
-├── glasses-app/               # Android Kotlin: HUD on Rokid
-└── glasses-channel-plugin/    # Python (MVP+1): Hermes channel plugin
+├── phone-app/                 # Android: WS↔Hermes + CXR-M bridge + chat UI
+├── glasses-app/               # Android: HUD on Rokid (CXR-S + CXR-L)
+└── hermes-channel-adapter/    # Python: BasePlatformAdapter + WS server
 ```
 
-The phone-app's `preBuild` task bundles the glasses APK into `phone-app/src/main/assets/glasses-app-release.apk` for sideloading via Rokid's WiFi P2P. The Python plugin is a separate folder, not a Gradle module, with its own `pyproject.toml` and install instructions targeting `~/.hermes/plugins/`.
-
-**Rationale:** Mirrors clawsses' shape, which the user has already validated as a sensible decomposition for this hardware.
+The phone-app's `preBuild` task bundles the glasses APK into `phone-app/src/main/assets/glasses-app-release.apk`. The Python adapter is a separate folder with its own `pyproject.toml`, installed under `~/.hermes/plugins/hermes-channel-adapter/`.
 
 ## Risks / Trade-offs
 
-- **Hermes plugin/channel extension surface is thin in docs** → MVP+1 (`glasses-channel-plugin`) may need source-diving in `gateway/platforms/` to find the right hook. Mitigation: scope the plugin task as a spike first; fall back to a webhook-only delivery target (Hermes already supports `webhook` as a platform) if a full channel adapter is more than a week's work.
-- **Hermes' 100-response LRU on Responses API** → Long-running named conversations may lose history if more than 100 responses are stored across all conversations system-wide. Mitigation: phone-app re-sends summary context on conversation resume if the server returns a 404 on the stored response chain. (Verify whether 100 is per-conversation or global.)
-- **`API_SERVER_KEY` exposes terminal access** → A leaked key is a full-system compromise on the Mac mini. Mitigation: store only in Android EncryptedSharedPreferences; document this clearly in the settings UI; recommend `chmod 600 ~/.hermes/.env`.
-- **Tailscale dependency** → If Tailscale is down or the phone is off-tailnet, the glasses do nothing. Mitigation: explicit "offline" state in HUD; document LAN-fallback config (`http://<lan-ip>:8642`) for users who want home-only operation without Tailscale.
-- **No Bluetooth backpressure for image bytes** → Sending a large base64 image over CXR-M can stall the chat stream. Mitigation: glasses-side hard cap at 256 KB JPEG before base64; if user takes a high-res photo, downscale aggressively (target 1024×768 or smaller).
-- **Android background-task hostile environment** → Foreground services and wake locks needed for Bluetooth + voice. Mitigation: structure phone-app exactly like clawsses (`GlassesConnectionService` foreground service); request battery-optimization exemption on first run.
-- **Rokid SDK is a closed binary** → Behavioral changes in CXR SDK versions can break us. Mitigation: pin SDK version in `build.gradle.kts`; document upgrade procedure.
-- **Drift between OpenAI Responses API spec and Hermes' implementation** → Hermes documents spec-native event names but may diverge. Mitigation: write the parser defensively (unknown event types → log + ignore), include a "raw events" debug log in the phone-app dev settings.
+- **`BasePlatformAdapter` token-streaming surface unverified.** We expect to forward `assistant_chunk` deltas, but whether the framework gives outbound-streaming hooks at adapter level (vs. only complete messages or `edit_message` updates) needs a spike. Worst case: adapter coalesces and uses `edit_message` for visible progress, with the phone↔glasses `chat_stream` envelope unchanged. (OQ2.)
+- **No streaming TTS to channels.** `tts_tool.py` writes complete audio files before delivery. Long replies wait for full render. Mitigation: keep replies short via instructions; consider contributing streaming TTS upstream later.
+- **WebSocket route binding into the gateway's `aiohttp` app.** `webhook.py` shows `app.router.add_post(...)` works for adapters; we expect `add_get` with WS upgrade to work the same way, but spike before locking in. (OQ4.)
+- **Single chat_id per phone+glasses pair, or one each?** The framework treats `chat_id` as the session boundary. Both phone-UI and glasses-HUD need to be the *same* chat (otherwise the user's typed phone message and spoken glasses message would land in separate Hermes sessions). We use a single `chat_id` per device pairing and route both surfaces to it. (OQ7.)
+- **CXR Caps frame-size limit unknown.** Probe early in task 6.x; only add fragmenting if a real MTU surfaces. (OQ8.)
+- **WiFi-P2P stale-status bug** in `CxrApi.startUploadApk` requires the Rokid-documented reflection workaround (`sdk-decompiled-reference.md:817-893`). We apply it from day one rather than after we hit the bug.
+- **AuthorizationHelper requires `com.rokid.sprite.aiapp` ≥ versionCode 100000** for CXR-L. We document this as a glasses prerequisite; first-run flow checks the package and surfaces a setup screen if missing.
+- **Tailscale dependency.** If Tailscale is down or the phone is off-tailnet, the WS doesn't connect. Mitigation: explicit "offline" state in HUD (`connection_update { connected: false }`); LAN-fallback config (`ws://<lan-ip>:<port>/glasses`).
+- **Phone foreground-service requirement.** Persistent WS + CXR Bluetooth need a foreground service. Same as clawsses' `GlassesConnectionService`; standard pattern, request battery-optimization exemption on first run.
+- **Rokid SDK is closed binary.** Pin SDK versions in `build.gradle.kts`; document upgrade procedure.
+- **Display "monochrome green" is panel lore, not docs.** We say "480×640 portrait, single-color render" in the spec; no contrast-tuning assumption that depends on a specific hue.
 
 ## Migration Plan
 
 This is a greenfield project; no existing system to migrate. Build order matches `tasks.md`:
 
-1. **Hardware bring-up**: Rokid glasses pairing, SDK credentials in `local.properties`, Tailscale up, Hermes gateway running with a non-default `API_SERVER_KEY`.
-2. **Protocol module**: `shared/` DTOs first — the contract both apps depend on.
-3. **Phone-app skeleton**: HermesClient (HTTPS + SSE + Bearer + `/v1/responses`), settings screen, no glasses integration yet. Verifiable from a single phone screen — type a message, see streaming response.
-4. **Glasses-app skeleton**: HUD with streaming-text rendering, gesture routing, no camera, no voice. Sideload to glasses, verify display + gestures.
-5. **Phone↔Glasses bridge**: Bluetooth/CXR-M wired up, debug-mode WebSocket fallback for emulator. End-to-end text loop works.
-6. **Voice loop**: Android STT on long-press, ElevenLabs/Edge TTS playback. Verify hands-free chat.
-7. **Camera path**: Glasses capture, downscale, base64, image_url. Verify "what am I looking at?" works.
-8. **Session picker**: Conversation manager in phone-app, glasses menu entry, switch + create flows.
-9. **Tool-progress indicator**: HUD subline.
-10. **MVP+1 — Channel plugin**: Python module, registration, webhook to phone-app, wake-on-message integration. Verify cron job pushes a message that wakes the glasses.
+1. **Hermes side first**: spike `BasePlatformAdapter` lifecycle, attachment handling, WS route binding, streaming hooks (resolves OQ2/OQ4). Confirm `cache_audio_from_bytes` import path. Get `glasses` showing in `hermes channels list` with a no-op echo adapter.
+2. **Hardware bring-up**: Rokid pairing, `local.properties`, Tailscale up, Hermes gateway running.
+3. **Protocol module**: `shared/` DTOs for both wires (WS frames + CXR Caps envelopes).
+4. **Phone-app skeleton**: WS client (OkHttp WebSocket), settings screen, chat UI mirror, no glasses integration yet. Verifiable by typing a message from the phone and seeing a streaming reply from Hermes.
+5. **Glasses-app skeleton**: HUD with text rendering, KeyEvent gesture routing, CXR-S subscribe, CXR-L `AuthorizationHelper` init. Sideload via `startUploadApk` and verify on hardware.
+6. **Phone↔glasses bridge**: CXR-M ↔ CXR-S wired up. End-to-end text loop works (typed phone message → glasses HUD streaming reply).
+7. **Voice loop**: glasses captures Opus on long-press, ships via CXR `sendStream` to phone, phone forwards via WS, adapter calls `cache_audio_from_bytes` + `handle_message`. Reply path: adapter overrides `send_voice` to push Opus down the WS, phone forwards to glasses, glasses plays via local speaker. Verify hands-free chat.
+8. **Camera path**: CXR-L `takePhoto` → 256 KB JPEG → CXR Caps to phone → WS → channel adapter → multimodal `event`. Verify "what am I looking at?" works.
+9. **Session picker**: Adapter exposes session list over WS; glasses picker + phone settings render it.
+10. **Tool-progress indicator**: HUD subline.
+11. **Wake-on-message**: cron job pushes through adapter; `wake_signal` flow on glasses.
+12. **Hardening**: foreground-service notification copy, raw-events debug log, README docs.
 
 There is no rollback strategy — the user can simply not install the APKs.
 
 ## Open Questions
 
-- **OQ1: Clawsses license.** Confirm clawsses' actual license (the README hints at MIT-style but we should verify before publishing or any code resemblance). We are writing fresh, but knowing the license tells us how careful we need to be about visual diff.
-- **OQ2: Hermes Responses API content-part field names.** Verify the exact JSON schema for `image_url` content parts on `/v1/responses` (the docs show `{"type": "image_url", "image_url": {...}}` for chat completions, but Responses API may use `input_image`). First integration spike will confirm.
-- **OQ3: Is the 100-response LRU per-conversation or global?** Affects how we handle history loss. Worth a quick experiment against a running gateway.
-- **OQ4: Channel-plugin extension API.** Is there a documented Python entry point for "register a custom channel," or do we need to subclass an adapter base class in `gateway/platforms/`? Spike before committing to MVP+1 scope.
-- **OQ5: TTS provider default.** ElevenLabs (premium voice, requires key) vs. Edge TTS (free, no key). Default to Edge for first-run smoothness, surface ElevenLabs in settings?
-- **OQ6: Foreground-service notification copy.** Android requires a persistent notification for foreground services — what does it say? "Hermes glasses connected" probably, but UX should review.
+- **OQ1: clawsses license.** Confirm before publishing or any code resemblance. Carries over from previous draft.
+- **OQ2: `BasePlatformAdapter` outbound streaming.** Does the framework expose token-level streaming hooks for adapter-side delivery, or only complete messages + `edit_message`? Spike before locking the WS frame protocol.
+- **OQ3: Hermes session model in the channel framework.** What does `chat_id` map to? Is the session list queryable via a documented API, or do we tail message-history? Spike during task 1.
+- **OQ4: aiohttp WS route binding.** Confirm that `BasePlatformAdapter` subclasses can call `app.router.add_get(...)` with `WebSocketResponse` upgrade on the gateway's app, the same way `webhook.py` calls `add_post`. If not, run a separate `aiohttp` listener in `connect()` on a configurable port.
+- **OQ5: TTS provider default.** Hermes' default is `edge` (free, no key). Confirm Edge gives acceptable voice quality on our test hardware; if not, surface ElevenLabs in the adapter config.
+- **OQ6: Foreground-service notification copy** ("Hermes glasses connected" — UX review).
+- **OQ7: Single `chat_id` per phone+glasses pair.** Verify the framework does not auto-split based on inbound surface; if it does, the adapter must rewrite `chat_id` so phone-typed and glasses-spoken messages share one Hermes session.
+- **OQ8: CXR Caps per-frame size limit.** Probe with a binary-Caps payload of increasing size early in task 6.x; add fragmenting only if a real cap surfaces. (Replaces previous draft's clawsses-derived 500-char assumption.)
+- **OQ9: CXR-L audio codec values.** `startAudioStream(codecType)` integer values are not in the docs. Probe; default to whatever delivers 16 kHz Opus.

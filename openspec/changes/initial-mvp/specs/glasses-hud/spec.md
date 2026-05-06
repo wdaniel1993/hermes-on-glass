@@ -2,7 +2,7 @@
 
 ### Requirement: HUD renders chat content on the Rokid display
 
-The glasses-app SHALL render a chat HUD on the Rokid 480×640 monochrome green micro-LED display using Jetpack Compose, with JetBrains Mono font and font size auto-calculated to hit a target column count.
+The glasses-app SHALL render a chat HUD on the Rokid 480×640 portrait display using Jetpack Compose, with JetBrains Mono font and font size auto-calculated to hit a target column count.
 
 #### Scenario: Initial render
 
@@ -19,38 +19,57 @@ The glasses-app SHALL render a chat HUD on the Rokid 480×640 monochrome green m
 - **WHEN** the user activates the SIZE menu and confirms
 - **THEN** the HUD position cycles Full → Bottom Half → Top Half and the SIZE icon previews the next position
 
-### Requirement: Touchpad gestures route between CONTENT and MENU focus areas
+### Requirement: Touchpad input is consumed via standard Android KeyEvents
 
-The glasses-app SHALL route touchpad gestures to one of two focus areas (CONTENT or MENU) and SHALL provide an unconditional long-press-to-talk gesture in both areas.
+The glasses-app SHALL handle touchpad gestures by listening to standard Android `KeyEvent`s on the right-temple touchpad (DPAD_LEFT/RIGHT/UP/DOWN/CENTER, BACK, KEYCODE_CAMERA), and SHALL provide an unconditional long-press-on-DPAD_CENTER for voice capture in any focus area. The glasses-app SHALL NOT depend on a non-standard gesture API.
 
 #### Scenario: Content scroll and menu push-through
 
-- **WHEN** focus is CONTENT and the user swipes backward at the top of the chat
+- **WHEN** focus is CONTENT and the user presses DPAD_LEFT (back-swipe key) at the top of the chat
 - **THEN** focus moves to MENU
 
 #### Scenario: Voice trigger from any focus
 
-- **WHEN** the user long-presses the touchpad while focus is either CONTENT or MENU
-- **THEN** the glasses-app sends `start_voice` to the phone and shows a voice-recording overlay
+- **WHEN** the user long-presses DPAD_CENTER while focus is either CONTENT or MENU
+- **THEN** the glasses-app starts a `MediaRecorder` Opus capture session, sends `voice_capture { streamId }` to the phone, streams Opus chunks via CXR, and shows a voice-recording overlay
 
 #### Scenario: Menu execute
 
-- **WHEN** focus is MENU on a menu item and the user taps
+- **WHEN** focus is MENU on a menu item and the user taps DPAD_CENTER
 - **THEN** the menu item executes (e.g., opens the session picker, cycles font size)
 
-### Requirement: Camera capture is attachable to the next user message
+### Requirement: Camera capture uses CXR-L takePhoto and is attachable to the next user message
 
-The glasses-app SHALL allow the user to capture a photo via the on-board camera and attach it to the next outgoing user message as a base64-encoded JPEG no larger than 256 KB before base64 encoding.
+The glasses-app SHALL capture photos via Rokid CXR-L `takePhoto(width, height, quality)` (binding via `AuthorizationHelper` to `com.rokid.sprite.aiapp`'s `IMediaStreamService`) and SHALL attach the captured JPEG to the next outgoing user message as a base64-encoded payload no larger than 256 KB before base64 encoding.
 
 #### Scenario: Capture and attach
 
-- **WHEN** the user triggers camera capture from the menu and then sends a voice message
+- **WHEN** the user triggers camera capture from the menu and then sends a voice or text message
 - **THEN** the resulting `user_input` envelope contains both `text` and `imageBase64` fields and the JPEG payload is at most 256 KB
 
 #### Scenario: Oversize source
 
 - **WHEN** the camera produces a frame larger than 256 KB after JPEG encoding
 - **THEN** the glasses-app downscales the image until the JPEG is at most 256 KB before base64-encoding
+
+#### Scenario: Authorization missing
+
+- **WHEN** `AuthorizationHelper` reports that `com.rokid.sprite.aiapp` is missing or below the required versionCode
+- **THEN** the glasses-app surfaces a setup error in the HUD and disables camera capture
+
+### Requirement: Voice capture and playback use on-glasses audio
+
+The glasses-app SHALL capture audio locally on the glasses using `MediaRecorder` (Opus encoder, microphone source) and SHALL play assistant audio replies locally via `MediaPlayer` on the on-glasses speaker. The glasses-app SHALL NOT route PCM through the phone speaker.
+
+#### Scenario: Long-press voice capture
+
+- **WHEN** the user long-presses DPAD_CENTER
+- **THEN** the glasses-app starts an Opus-encoded `MediaRecorder` session reading from `AudioSource.MIC`, streams encoded chunks to the phone via CXR `sendStream` (or `startAudioStream` callback), and shows a recording overlay until release
+
+#### Scenario: Assistant audio playback
+
+- **WHEN** the phone delivers a `voice_play { id, audioRef }` envelope
+- **THEN** the glasses-app plays the referenced Opus bytes via `MediaPlayer` on the local speaker
 
 ### Requirement: Session picker switches the active conversation
 
@@ -73,12 +92,17 @@ The glasses-app SHALL respond to `wake_signal` envelopes from the phone by wakin
 #### Scenario: Cron-message wake
 
 - **WHEN** the display is in standby and the phone sends `wake_signal { reason: "cron_message" }`
-- **THEN** the glasses-app wakes the display and sends `wake_ack { ready: true }` within 1 second
+- **THEN** the glasses-app wakes the display (via Activity `turnScreenOn=true`), sends `wake_ack { ready: true }` within 1 second, and reports the new state via `display_state { active }`
 
 #### Scenario: Wake fails
 
 - **WHEN** the display cannot be woken (hardware failure, system lock)
 - **THEN** the glasses-app sends `wake_ack { ready: false }`
+
+#### Scenario: Display sleep reported
+
+- **WHEN** the system enters screen-off (via `setScreenOffTimeout` or user action)
+- **THEN** the glasses-app emits `display_state { asleep }` to the phone via the `ScreenStatusUpdateListener` callback
 
 ### Requirement: Tool-progress events display as a single HUD subline
 
