@@ -1,0 +1,2 @@
+-keep class dev.wallner.hermesonglass.shared.** { *; }
+-keepclassmembers class dev.wallner.hermesonglass.shared.** { *; }

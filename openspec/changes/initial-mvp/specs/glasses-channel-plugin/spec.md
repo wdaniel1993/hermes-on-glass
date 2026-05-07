@@ -63,26 +63,27 @@ The adapter SHALL override `send`, `send_voice`, and `play_tts` (and override or
 
 #### Scenario: Tool progress event
 
-- **WHEN** the framework or response pipeline emits a tool-call lifecycle event
-- **THEN** the adapter emits a `tool_progress { messageId, toolName, phase }` frame to the matching session
+- **WHEN** the framework dispatches a tool-progress message via `send` / `edit_message` (Hermes formats these as `"<emoji> <tool_name>: \"<preview>\"..."` text — see `gateway/run.py` around line 12860; there is no structured per-tool adapter hook today)
+- **THEN** the adapter heuristically parses the formatted text, extracts `tool_name` and optional `preview`, and emits a `tool_progress { messageId, toolName, phase, preview }` frame instead of an `assistant_chunk`
+- **AND** if the parse fails, the message falls through as a regular `assistant_chunk` (no false positives from ordinary assistant content)
 
 ### Requirement: Adapter exposes Hermes-initiated pushes with origin metadata
 
-The adapter SHALL convert Hermes-initiated deliveries (cron jobs, run completions, agent nudges) into `push_message` frames with the originating type encoded in the `origin` field.
+The adapter SHALL convert Hermes-initiated deliveries (cron jobs, run completions, agent nudges) into `push_message` frames with the originating type encoded in the `origin` field. The adapter exposes an explicit `push(chat_id, text, origin, ...)` helper for callers that know the origin, AND `send(chat_id, content, metadata)` SHALL route to a `push_message` frame whenever `metadata["origin"]` is one of `cron-job`, `run-completion`, or `agent-nudge`. (Hermes' cron / run-completion paths today call `send` without origin metadata; this design lets the adapter degrade gracefully — frames arrive as regular `assistant_chunk` until the framework grows origin-aware metadata.)
 
 #### Scenario: Cron-origin push
 
-- **WHEN** a scheduled cron job triggers a delivery to `chat_id`
+- **WHEN** a caller invokes `push(chat_id, text, origin="cron-job", job_id=...)` or `send(chat_id, text, metadata={"origin": "cron-job", "job_id": ...})`
 - **THEN** the adapter emits `push_message { origin: "cron-job", jobId, conversation, messageId, text }` on the WebSocket session matching `chat_id`
 
 #### Scenario: Run-completion push
 
-- **WHEN** a long-running task completes and is configured to notify the channel
+- **WHEN** a long-running task completes and is configured to notify the channel via `send` with `metadata["origin"] == "run-completion"` (or `push(..., origin="run-completion", run_id=...)`)
 - **THEN** the adapter emits `push_message { origin: "run-completion", runId, conversation, messageId, text }`
 
 #### Scenario: Agent-nudge push
 
-- **WHEN** the agent itself originates an unsolicited message to the channel
+- **WHEN** the agent itself originates an unsolicited message to the channel via `send` with `metadata["origin"] == "agent-nudge"` (or `push(..., origin="agent-nudge")`)
 - **THEN** the adapter emits `push_message { origin: "agent-nudge", conversation, messageId, text }`
 
 ### Requirement: Adapter is configurable via a single YAML file
