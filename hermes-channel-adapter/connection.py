@@ -18,7 +18,10 @@ from typing import Any, Dict, List, Optional
 
 from aiohttp import web
 
-from frames import SessionInfo
+try:
+    from .frames import SessionInfo
+except ImportError:  # standalone (tests put the dir on sys.path)
+    from frames import SessionInfo  # type: ignore[no-redef]
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +46,11 @@ class Connection:
     # is automatically released when the connection closes — partial uploads
     # from a client that disconnected mid-stream can't leak forever.
     voice_streams: Dict[str, Dict[int, bytes]] = field(default_factory=dict)
+    # Pending deferred `assistant_complete` tasks keyed by message_id. A task
+    # is scheduled when send() emits a one-shot chunk; if edit_message() lands
+    # for the same id before the task fires, the task is cancelled so a
+    # streaming follow-up doesn't get a premature complete.
+    pending_completes: Dict[str, asyncio.Task] = field(default_factory=dict)
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def __post_init__(self) -> None:

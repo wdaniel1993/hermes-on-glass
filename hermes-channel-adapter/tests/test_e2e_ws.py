@@ -390,6 +390,93 @@ async def test_send_emits_assistant_chunk_and_edit_streams_delta(adapter: Glasse
         await _close_ws(ws)
 
 
+async def test_one_shot_send_emits_deferred_assistant_complete(adapter: GlassesAdapter):
+    """A bare send() with no edit follow-up should still close the turn."""
+    # Shorten the deferral so the test waits ~0.1s instead of 0.75s.
+    adapter._DEFERRED_COMPLETE_DELAY_S = 0.1  # type: ignore[attr-defined]
+
+    ws = await _connect_ws(adapter)
+    try:
+        await ws.send_json({"type": "client_hello", "protocolVersion": 1})
+        welcome = await _recv_json(ws)
+        await ws.send_json({"type": "user_message", "id": "in-1", "text": "hi"})
+        await _wait_for(lambda: len(adapter._test_inbound) >= 1)  # type: ignore[attr-defined]
+        chat_id = adapter._test_inbound[-1].source.chat_id  # type: ignore[attr-defined]
+
+        result = await adapter.send(chat_id, "All done.")
+        assert result.success and result.message_id
+        chunk = await _recv_json(ws)
+        assert chunk["type"] == "assistant_chunk"
+        assert chunk["chunk"] == "All done."
+        msg_id = chunk["id"]
+
+        complete = await _recv_json(ws)
+        assert complete == {
+            "type": "assistant_complete",
+            "id": msg_id,
+            "sessionKey": welcome["currentSessionKey"],
+        }
+    finally:
+        await _close_ws(ws)
+
+
+async def test_edit_message_after_send_cancels_deferred_complete(adapter: GlassesAdapter):
+    """Streaming pattern: edit_message before deferred timer should suppress it."""
+    adapter._DEFERRED_COMPLETE_DELAY_S = 0.1  # type: ignore[attr-defined]
+
+    ws = await _connect_ws(adapter)
+    try:
+        await ws.send_json({"type": "client_hello", "protocolVersion": 1})
+        await _recv_json(ws)
+        await ws.send_json({"type": "user_message", "id": "in-1", "text": "stream"})
+        await _wait_for(lambda: len(adapter._test_inbound) >= 1)  # type: ignore[attr-defined]
+        chat_id = adapter._test_inbound[-1].source.chat_id  # type: ignore[attr-defined]
+
+        await adapter.send(chat_id, "Hello")
+        first = await _recv_json(ws)
+        msg_id = first["id"]
+        # edit immediately — well within the 100ms deferral window
+        await adapter.edit_message(chat_id, msg_id, "Hello world", finalize=True)
+        delta = await _recv_json(ws)
+        assert delta["chunk"] == " world"
+        complete = await _recv_json(ws)
+        assert complete["type"] == "assistant_complete"
+        # Wait past the deferred-complete window — no second complete should arrive.
+        await asyncio.sleep(0.2)
+        # Drain any extra frame; assert the queue is quiet.
+        try:
+            extra = await asyncio.wait_for(ws.receive(), timeout=0.05)
+            assert extra.type != aiohttp.WSMsgType.TEXT, (
+                f"unexpected extra frame after streaming complete: {extra.data}"
+            )
+        except asyncio.TimeoutError:
+            pass
+    finally:
+        await _close_ws(ws)
+
+
+async def test_send_private_notice_emits_system_notice_frame(adapter: GlassesAdapter):
+    """Operational notices route through send_private_notice → system_notice."""
+    ws = await _connect_ws(adapter)
+    try:
+        await ws.send_json({"type": "client_hello", "protocolVersion": 1})
+        welcome = await _recv_json(ws)
+        await ws.send_json({"type": "user_message", "id": "in-1", "text": "hi"})
+        await _wait_for(lambda: len(adapter._test_inbound) >= 1)  # type: ignore[attr-defined]
+        chat_id = adapter._test_inbound[-1].source.chat_id  # type: ignore[attr-defined]
+
+        result = await adapter.send_private_notice(
+            chat_id, user_id="device-x", content="📬 Notice text"
+        )
+        assert result.success
+        frame = await _recv_json(ws)
+        assert frame["type"] == "system_notice"
+        assert frame["text"] == "📬 Notice text"
+        assert frame["sessionKey"] == welcome["currentSessionKey"]
+    finally:
+        await _close_ws(ws)
+
+
 # ── Outbound: tool-progress heuristic ───────────────────────────────────
 
 async def test_send_tool_progress_text_emits_tool_progress_frame(adapter: GlassesAdapter):

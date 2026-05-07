@@ -38,33 +38,64 @@ from gateway.platforms.base import (
     cache_image_from_bytes,
 )
 
-from config import AdapterConfig, load_config
-from connection import Connection
-from frames import (
-    PROTOCOL_VERSION,
-    ClientHello,
-    DisplayState,
-    ImageAttachment,
-    NewSession,
-    Ping,
-    Pong,
-    SessionInfo,
-    SlashCommand,
-    SwitchSession,
-    UserMessage,
-    VoiceNote,
-    assistant_audio,
-    assistant_chunk,
-    assistant_complete,
-    connection_update,
-    parse_frame,
-    pong,
-    push_message,
-    server_welcome,
-    session_list,
-    tool_progress,
-)
-from tool_progress import parse as parse_tool_progress
+try:  # plugin context (loaded as a package by Hermes)
+    from .config import AdapterConfig, load_config
+    from .connection import Connection
+    from .frames import (
+        PROTOCOL_VERSION,
+        ClientHello,
+        DisplayState,
+        ImageAttachment,
+        NewSession,
+        Ping,
+        Pong,
+        SessionInfo,
+        SlashCommand,
+        SwitchSession,
+        UserMessage,
+        VoiceNote,
+        assistant_audio,
+        assistant_chunk,
+        assistant_complete,
+        connection_update,
+        parse_frame,
+        pong,
+        push_message,
+        server_welcome,
+        session_list,
+        system_notice,
+        tool_progress,
+    )
+    from .tool_progress import parse as parse_tool_progress
+except ImportError:  # standalone (tests put the dir on sys.path)
+    from config import AdapterConfig, load_config  # type: ignore[no-redef]
+    from connection import Connection  # type: ignore[no-redef]
+    from frames import (  # type: ignore[no-redef]
+        PROTOCOL_VERSION,
+        ClientHello,
+        DisplayState,
+        ImageAttachment,
+        NewSession,
+        Ping,
+        Pong,
+        SessionInfo,
+        SlashCommand,
+        SwitchSession,
+        UserMessage,
+        VoiceNote,
+        assistant_audio,
+        assistant_chunk,
+        assistant_complete,
+        connection_update,
+        parse_frame,
+        pong,
+        push_message,
+        server_welcome,
+        session_list,
+        system_notice,
+        tool_progress,
+    )
+    from tool_progress import parse as parse_tool_progress  # type: ignore[no-redef]
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +209,10 @@ class GlassesAdapter(BasePlatformAdapter):
         for chat_id in [k for k, v in self._chat_id_index.items() if v == conn.conn_id]:
             self._chat_id_index.pop(chat_id, None)
         self._connections.pop(conn.conn_id, None)
+        for task in conn.pending_completes.values():
+            if not task.done():
+                task.cancel()
+        conn.pending_completes.clear()
         try:
             if not conn.ws.closed:
                 await conn.ws.close()
@@ -467,6 +502,84 @@ class GlassesAdapter(BasePlatformAdapter):
             ))
         if not ok:
             return SendResult(success=False, error="ws send failed")
+        # One-shot vs streaming-first-chunk are indistinguishable at this
+        # call site — the gateway's stream_consumer also uses send() to start
+        # a streaming bubble and follows up with edit_message(). Schedule the
+        # closing frame slightly in the future; edit_message() cancels the
+        # pending task so streaming turns don't see a premature complete.
+        if conn.message_kind.get(message_id) == "content":
+            self._schedule_deferred_complete(conn, message_id, session_uuid)
+        return SendResult(success=True, message_id=message_id)
+
+    # Window after a one-shot send() to wait for a streaming follow-up before
+    # finalizing. The gateway's edit cadence is ~100-200ms; 750ms is enough
+    # headroom that streaming turns reliably cancel the timer, while the phone
+    # still sees `assistant_complete` within a perceptible-but-fast window.
+    _DEFERRED_COMPLETE_DELAY_S = 0.75
+
+    def _schedule_deferred_complete(
+        self,
+        conn: Connection,
+        message_id: str,
+        session_uuid: str,
+    ) -> None:
+        existing = conn.pending_completes.pop(message_id, None)
+        if existing is not None and not existing.done():
+            existing.cancel()
+
+        async def _fire() -> None:
+            try:
+                await asyncio.sleep(self._DEFERRED_COMPLETE_DELAY_S)
+            except asyncio.CancelledError:
+                return
+            await conn.send_json(assistant_complete(
+                message_id=message_id,
+                session_key=session_uuid,
+            ))
+            conn.sent_text.pop(message_id, None)
+            conn.message_kind.pop(message_id, None)
+            conn.pending_completes.pop(message_id, None)
+
+        conn.pending_completes[message_id] = asyncio.create_task(_fire())
+
+    def _cancel_deferred_complete(
+        self,
+        conn: Connection,
+        message_id: str,
+    ) -> None:
+        task = conn.pending_completes.pop(message_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def send_private_notice(
+        self,
+        chat_id: str,
+        user_id: Optional[str],
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Deliver gateway notices on a distinct frame type.
+
+        Without this override the gateway's notices (no-home-channel reminder,
+        approval prompts, etc.) arrive as ``assistant_chunk`` and are
+        indistinguishable from real model output. Routing them through
+        ``system_notice`` lets the phone surface them in a system slot.
+        Requires ``extra.notice_delivery: private`` on the platform's
+        ``config.yaml`` block so the gateway picks this path.
+        """
+        conn = self._conn_for_chat(chat_id)
+        if conn is None:
+            return SendResult(success=False, error="no live connection for chat_id")
+        session_uuid = conn.session_uuid_from_chat_id(chat_id) or conn.current_session_uuid
+        message_id = uuid.uuid4().hex[:12]
+        ok = await conn.send_json(system_notice(
+            message_id=message_id,
+            text=content,
+            session_key=session_uuid,
+        ))
+        if not ok:
+            return SendResult(success=False, error="ws send failed")
         return SendResult(success=True, message_id=message_id)
 
     async def edit_message(
@@ -480,6 +593,9 @@ class GlassesAdapter(BasePlatformAdapter):
         conn = self._conn_for_chat(chat_id)
         if conn is None:
             return SendResult(success=False, error="no live connection for chat_id")
+        # Streaming follow-up — cancel any pending deferred-complete from a
+        # prior send() so the timer doesn't race the edits we're about to do.
+        self._cancel_deferred_complete(conn, message_id)
         session_uuid = conn.session_uuid_from_chat_id(chat_id) or conn.current_session_uuid
         kind = conn.message_kind.get(message_id, "content")
         prev = conn.sent_text.get(message_id, "")

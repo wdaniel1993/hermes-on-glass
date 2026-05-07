@@ -43,6 +43,11 @@ google-services.json
 # Android Profiling
 *.hprof
 
+# Adapter runtime config (contains shared_secret) — resolved through the
+# ~/.hermes/plugins/hermes-channel-adapter symlink, so it lives inside
+# this repo dir at runtime.
+hermes-channel-adapter/config.yaml
+
 # Python (hermes-channel-adapter)
 __pycache__/
 *.py[cod]

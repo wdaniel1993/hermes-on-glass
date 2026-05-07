@@ -285,6 +285,25 @@ def session_list(
     }
 
 
+def system_notice(
+    message_id: str,
+    text: str,
+    session_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Out-of-band gateway notice (e.g. "no home channel set").
+
+    Distinct from ``assistant_chunk`` so the phone can render system messages
+    differently (or suppress them entirely) without inferring intent from the
+    body text.
+    """
+    return _camelize({
+        "type": "system_notice",
+        "id": message_id,
+        "text": text,
+        "session_key": session_key,
+    })
+
+
 def connection_update(connected: bool) -> Dict[str, Any]:
     return {"type": "connection_update", "connected": connected}
 
