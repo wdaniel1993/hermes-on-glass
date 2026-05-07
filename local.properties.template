@@ -1,0 +1,14 @@
+# Copy to local.properties (gitignored) and fill in.
+# Do NOT commit local.properties.
+
+# Android SDK location — set automatically by Android Studio on first sync.
+# Override here if your SDK lives somewhere unusual.
+# sdk.dir=/Users/<you>/Library/Android/sdk
+
+# Rokid CXR-M credentials — required by phone-app at runtime to discover
+# and pair with Rokid Glasses. Issued via the Rokid developer console;
+# bound to your application package name. Injected into BuildConfig at
+# build time (phone-app only).
+rokid.clientId=
+rokid.clientSecret=
+rokid.accessKey=

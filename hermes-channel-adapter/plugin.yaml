@@ -1,0 +1,11 @@
+name: hermes-channel-adapter
+kind: platform
+version: 0.1.0
+description: >
+  WebSocket channel adapter for Hermes-on-Glass — pairs a phone bridge with
+  a HUD on Rokid Glasses by hosting a single WebSocket endpoint that the
+  phone connects to outbound. Subclasses BasePlatformAdapter; bidirectional
+  text, voice (Opus), and image traffic plus Hermes-initiated cron and
+  run-completion pushes flow over one socket.
+author: Daniel Wallner
+requires_env: []

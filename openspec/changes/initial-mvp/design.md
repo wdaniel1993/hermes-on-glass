@@ -64,9 +64,11 @@ The reference architecture is `dweddepohl/clawsses` — an Android phone-app + R
 
 **Choice:** Ship a Python `BasePlatformAdapter` subclass (`hermes-channel-adapter/`) that registers a channel named `glasses`. All chat traffic — user→agent, agent→user, cron pushes, run-completions, agent-nudges — flows through this one adapter.
 
+**Delivery via the plugin path** (verified spike 1.1): the adapter ships as a Hermes plugin under `~/.hermes/plugins/hermes-channel-adapter/` with `plugin.yaml` + `adapter.py` + `__init__.py` (re-exports `register`). The `register(ctx)` entry point calls `ctx.register_platform(name="glasses", adapter_factory=lambda cfg: GlassesAdapter(cfg), ...)`. Zero core Hermes code changes — bypasses the 16-step built-in checklist. Reference: `plugins/platforms/irc/adapter.py` in `hermes-agent`. Built-in checklist (`gateway/run.py`, `gateway/config.py`, `toolsets.py`, `cron/scheduler.py`, etc.) is not relevant to this project.
+
 **Rationale:** Idiomatic to Hermes (`gateway/platforms/` already hosts ~20 channels). Single source of truth for sessions and voice. Cron/run/nudge pushes share the same delivery path as user-driven turns; no second transport.
 
-**Alternatives considered:** REST client calling `/v1/responses` (rejected — splits push and pull paths, requires reproducing session management, doesn't compose with cron); MCP (rejected — wrong abstraction; MCP is for tools, not channels).
+**Alternatives considered:** REST client calling `/v1/responses` (rejected — splits push and pull paths, requires reproducing session management, doesn't compose with cron); MCP (rejected — wrong abstraction; MCP is for tools, not channels); built-in adapter (rejected — would require modifying core Hermes; plugin path is the documented community route).
 
 ### D2: WebSocket transport, outbound from phone, Bearer-on-upgrade
 
@@ -124,7 +126,11 @@ The reference architecture is `dweddepohl/clawsses` — an Android phone-app + R
 
 **Choice:** Phone forwards each `assistant_chunk { id, chunk, parentId }` WS frame from the channel into a phone→glasses `chat_stream { id, chunk }` envelope. Glasses appends. On `assistant_complete { id }` from the channel, phone sends `chat_stream_end { id }`.
 
-**Rationale:** Same as the previous draft's D5 — Hermes deltas are already incremental, and it remains true through the channel-adapter wrap. Whether `BasePlatformAdapter` exposes per-token streaming hooks for *outbound* delivery is the open question (OQ2); if it doesn't, the adapter coalesces and uses `edit_message` for visible progress, while keeping the `chat_stream` envelope semantics on the phone↔glasses wire.
+**Adapter-side mapping** (verified spike 1.5): the framework's `GatewayStreamConsumer` (`gateway/stream_consumer.py`) drives streaming via the **edit-message transport** — there is no per-token outbound hook. It calls `adapter.send(chat_id, first_chunk)` for the initial visible message, then `adapter.edit_message(chat_id, message_id, accumulated_text, finalize=...)` repeatedly with rate limiting (1s edit interval, 40-char buffer threshold). On the final edit, `finalize=True` is set. We map this to our WS frames by overriding both:
+- `send(chat_id, content, ...)` → emit `assistant_chunk { id: <generated>, chunk: content, parentId: ... }`, return `SendResult(success=True, message_id=<generated>)` so the framework has an ID to edit.
+- `edit_message(chat_id, message_id, content, finalize)` → compute delta = `content[len(last_sent_for_id):]`, emit `assistant_chunk { id: message_id, chunk: <delta> }`. On `finalize=True`, emit `assistant_complete { id: message_id }`. Track per-message-id last-sent state to compute deltas. (Granularity is the framework's, not per-token.)
+
+**Rationale:** Same as the previous draft's D5 — Hermes deltas are already incremental, and the edit-stream pattern preserves that. Phone↔glasses semantics stay clean.
 
 ### D9: Tool-progress as a HUD subline (unchanged)
 
@@ -203,12 +209,17 @@ There is no rollback strategy — the user can simply not install the APKs.
 
 ## Open Questions
 
-- **OQ1: clawsses license.** Confirm before publishing or any code resemblance. Carries over from previous draft.
-- **OQ2: `BasePlatformAdapter` outbound streaming.** Does the framework expose token-level streaming hooks for adapter-side delivery, or only complete messages + `edit_message`? Spike before locking the WS frame protocol.
-- **OQ3: Hermes session model in the channel framework.** What does `chat_id` map to? Is the session list queryable via a documented API, or do we tail message-history? Spike during task 1.
-- **OQ4: aiohttp WS route binding.** Confirm that `BasePlatformAdapter` subclasses can call `app.router.add_get(...)` with `WebSocketResponse` upgrade on the gateway's app, the same way `webhook.py` calls `add_post`. If not, run a separate `aiohttp` listener in `connect()` on a configurable port.
-- **OQ5: TTS provider default.** Hermes' default is `edge` (free, no key). Confirm Edge gives acceptable voice quality on our test hardware; if not, surface ElevenLabs in the adapter config.
-- **OQ6: Foreground-service notification copy** ("Hermes glasses connected" — UX review).
-- **OQ7: Single `chat_id` per phone+glasses pair.** Verify the framework does not auto-split based on inbound surface; if it does, the adapter must rewrite `chat_id` so phone-typed and glasses-spoken messages share one Hermes session.
-- **OQ8: CXR Caps per-frame size limit.** Probe with a binary-Caps payload of increasing size early in task 6.x; add fragmenting only if a real cap surfaces. (Replaces previous draft's clawsses-derived 500-char assumption.)
-- **OQ9: CXR-L audio codec values.** `startAudioStream(codecType)` integer values are not in the docs. Probe; default to whatever delivers 16 kHz Opus.
+### Resolved
+
+- **OQ1 — clawsses license: AGPL-3.0** (verified via `gh api repos/dweddepohl/clawsses`). Forking or vendoring any clawsses code would force this entire project to AGPL. The proposal's existing non-goal "no fork or vendoring of clawsses code" is therefore a *legal* constraint, not just an aesthetic one. Clean-room reimplementation of architecture/UX patterns is fine — AGPL covers code expression, not ideas.
+- **OQ2 — Outbound streaming hook (verified spike 1.5):** Framework streams via the **edit-message transport** (`gateway/stream_consumer.py`), not per-token callbacks. `GatewayStreamConsumer` calls `adapter.send(...)` for the first visible message, then `adapter.edit_message(chat_id, message_id, accumulated_text, finalize=...)` with rate limiting (1s edit interval, 40-char threshold). Mapping is documented in D8.
+- **OQ3 — Session model (verified spike 1.4):** `chat_id` is an adapter-controlled string. The framework builds `session_key` from `(platform, chat_id)` plus optional `thread_id` (`gateway/session.py:build_session_key`). One `SessionStore` entry per `session_key`. To expose multiple Hermes sessions to a single phone+glasses pair, the adapter varies the `chat_id` per active conversation: scheme is `glasses:{conn_id}:{session_uuid}`. Switching sessions changes the suffix; the framework treats each suffix as a separate session.
+- **OQ4 — aiohttp WS hosting (verified spike 1.2):** Adapters run their own standalone `aiohttp` listener inside `connect()` — `web.Application()` + `app.router.add_get('/glasses', self._handle_ws)` + `web.AppRunner` + `web.TCPSite(host, port)`. Not shared with a gateway-level app router. Pattern matches `gateway/platforms/webhook.py` (which does the same with `add_post`). Port is configurable via `config.yaml`.
+- **OQ7 — Single `chat_id` per phone+glasses pair (verified spike 1.4):** The framework does not auto-split based on inbound surface — `chat_id` is whatever the adapter sets on the `MessageEvent.source`. We pick one `chat_id` per active session (per OQ3 resolution). Phone-typed and glasses-spoken messages on the same active session share one Hermes session by construction.
+
+### Open
+
+- **OQ5: TTS provider default.** Hermes' default is `edge` (free, no key). Confirm Edge gives acceptable voice quality on our test hardware; if not, surface ElevenLabs in the adapter config. Hardware-dependent — defer until §9 voice-loop testing.
+- **OQ6: Foreground-service notification copy** ("Hermes glasses connected" — UX review). Defer to §13.2.
+- **OQ8: CXR Caps per-frame size limit.** Probe with a binary-Caps payload of increasing size in §8.4. (Replaces previous draft's clawsses-derived 500-char assumption.)
+- **OQ9: CXR-L audio codec values.** `startAudioStream(codecType)` integer values are not in the docs. Probe in §9.2; default to whatever delivers 16 kHz Opus.

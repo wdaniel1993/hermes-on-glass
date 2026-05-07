@@ -2,6 +2,12 @@
 .gradle/
 build/
 
+# Kotlin compiler daemon caches (incremental build state)
+.kotlin/
+
+# macOS Finder metadata
+.DS_Store
+
 # Local configuration file (sdk path, etc)
 local.properties
 
@@ -15,6 +21,10 @@ captures/
 *.aab
 *.apk
 output-metadata.json
+
+# bundleGlassesApk output — copied from glasses-app's build into phone-app's
+# assets at preBuild time. Treated as a build artifact, not source.
+phone-app/src/main/assets/glasses-app-release.apk
 
 # IntelliJ
 *.iml
@@ -32,3 +42,29 @@ google-services.json
 
 # Android Profiling
 *.hprof
+
+# Adapter runtime config (contains shared_secret) — resolved through the
+# ~/.hermes/plugins/hermes-channel-adapter symlink, so it lives inside
+# this repo dir at runtime.
+hermes-channel-adapter/config.yaml
+
+# Python (hermes-channel-adapter)
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.venv/
+venv/
+env/
+.python-version
+dist/
+*.so

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-channel-adapter"
+version = "0.1.0"
+description = "WebSocket channel adapter for Hermes-on-Glass"
+requires-python = ">=3.11"
+authors = [{ name = "Daniel Wallner" }]
+license = { text = "MIT" }
+dependencies = [
+  "aiohttp>=3.9,<4",
+  "pyyaml>=6.0,<7",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+]
+
+[tool.setuptools]
+py-modules = ["adapter", "config", "connection", "frames", "tool_progress"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
