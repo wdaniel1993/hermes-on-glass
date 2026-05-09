@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Cleartext is permitted because the Hermes WebSocket runs over Tailscale
+  (or trusted LAN) per design.md D2. The trust boundary is the Tailscale
+  WireGuard tunnel, not TLS. Phone-app speaks ws:// to a user-configured
+  host (default `ws://mac:8765/glasses`, MagicDNS). The user can swap that
+  to any reachable host in Settings; we don't pre-declare specific domains
+  because that would silently break URLs the user enters.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

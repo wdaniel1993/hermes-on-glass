@@ -14,9 +14,18 @@
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!-- Android 11+ package visibility: we look up Hi Rokid AI app presence
+         via PackageManager.getPackageInfo, which requires either
+         QUERY_ALL_PACKAGES or declaring the specific packages here. -->
+    <queries>
+        <package android:name="com.rokid.sprite.global.aiapp" />
+        <package android:name="com.rokid.sprite.aiapp" />
+    </queries>
+
     <application
         android:name=".HermesApp"
         android:label="Hermes Glasses"
+        android:networkSecurityConfig="@xml/network_security_config"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.NoActionBar">
 

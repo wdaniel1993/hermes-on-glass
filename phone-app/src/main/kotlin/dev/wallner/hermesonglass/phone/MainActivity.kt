@@ -27,13 +27,14 @@ import com.rokid.sprite.aiapp.externalapp.auth.AuthorizationHelper
 import dev.wallner.hermesonglass.phone.data.BatteryOptimizationPrompt
 import dev.wallner.hermesonglass.phone.data.BluetoothPermissions
 import dev.wallner.hermesonglass.phone.data.rokid.HiRokidInstallLauncher
+import dev.wallner.hermesonglass.phone.data.rokid.HiRokidPresence
+import dev.wallner.hermesonglass.phone.data.rokid.RokidAuthLauncher
 import dev.wallner.hermesonglass.phone.service.GlassesConnectionService
 import dev.wallner.hermesonglass.phone.ui.nav.HermesNavHost
 import dev.wallner.hermesonglass.phone.ui.theme.HermesTheme
 import timber.log.Timber
 
 private const val ROKID_AUTH_REQUEST_CODE = 1001
-private const val ROKID_AI_APP_PACKAGE = "com.rokid.sprite.aiapp"
 
 class MainActivity : ComponentActivity() {
 
@@ -70,7 +71,7 @@ class MainActivity : ComponentActivity() {
                                 detail = "Install the Hi Rokid AI app to connect to your glasses.",
                                 actionLabel = "Install Hi Rokid",
                                 onAction = {
-                                    HiRokidInstallLauncher.launch(this@MainActivity, ROKID_AI_APP_PACKAGE)
+                                    HiRokidInstallLauncher.launch(this@MainActivity)
                                 },
                                 secondaryLabel = "Recheck",
                                 onSecondary = ::refreshAuthState,
@@ -81,10 +82,13 @@ class MainActivity : ComponentActivity() {
                                 detail = "Grant the Hermes app permission to talk to your glasses through Hi Rokid.",
                                 actionLabel = "Authorize",
                                 onAction = {
-                                    AuthorizationHelper.INSTANCE.requestAuthorization(
+                                    val ok = RokidAuthLauncher.requestAuthorization(
                                         this@MainActivity,
                                         ROKID_AUTH_REQUEST_CODE,
                                     )
+                                    if (!ok) {
+                                        Timber.w("No Hi Rokid auth activity resolved on this device")
+                                    }
                                 },
                             )
                         }
@@ -121,7 +125,12 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun refreshAuthState() {
-        hiRokidInstalled = AuthorizationHelper.INSTANCE.isRequiredRokidAppInstalled(this)
+        // The SDK's AuthorizationHelper.isRequiredRokidAppInstalled only
+        // recognises the China package (com.rokid.sprite.aiapp) and gives a
+        // false negative for users on the global build from Google Play
+        // (com.rokid.sprite.global.aiapp). Use our own PackageManager check
+        // that accepts either.
+        hiRokidInstalled = HiRokidPresence.isInstalled(this)
         hasToken = app.prefs.hasRokidAuthToken()
     }
 

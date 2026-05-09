@@ -132,12 +132,50 @@ fun SettingsScreen(
 
             Spacer(Modifier.height(24.dp))
 
-            Text(
-                "Glasses pairing status appears here once the CXR-M handshake is wired up (task 8.x).",
-                style = MaterialTheme.typography.bodySmall,
-            )
+            HorizontalDivider()
+
+            GlassesAppSection(viewModel = viewModel)
         }
     }
+}
+
+@Composable
+private fun GlassesAppSection(viewModel: SettingsViewModel) {
+    val state by viewModel.glassesAppState.collectAsState()
+    val capsConnected by viewModel.capsConnected.collectAsState()
+
+    Text("Glasses app", style = MaterialTheme.typography.titleSmall)
+    Text(describe(state), style = MaterialTheme.typography.bodyMedium)
+
+    val busy = state is GlassesAppState.Installing || state is GlassesAppState.Launching
+    Button(
+        onClick = viewModel::triggerInstall,
+        enabled = capsConnected && !busy,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Text(
+            when {
+                busy -> "Working…"
+                state is GlassesAppState.Installed -> "Reinstall & launch glasses app"
+                else -> "Install & launch glasses app"
+            },
+        )
+    }
+    if (!capsConnected) {
+        Text(
+            "Connect to Hermes first.",
+            style = MaterialTheme.typography.bodySmall,
+        )
+    }
+}
+
+private fun describe(state: GlassesAppState): String = when (state) {
+    GlassesAppState.Unknown -> "Glasses app: status unknown"
+    GlassesAppState.NotInstalled -> "Glasses app: not installed"
+    GlassesAppState.Installed -> "Glasses app: installed"
+    GlassesAppState.Installing -> "Glasses app: installing… (~30s on first push)"
+    GlassesAppState.Launching -> "Glasses app: launching…"
+    is GlassesAppState.Failed -> "Glasses app: failed — ${state.reason}"
 }
 
 @Composable

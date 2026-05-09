@@ -2,14 +2,17 @@ package dev.wallner.hermesonglass.phone.ui.settings
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
 import dev.wallner.hermesonglass.phone.HermesApp
 import dev.wallner.hermesonglass.phone.data.debug.DebugEventLog
 import dev.wallner.hermesonglass.phone.data.prefs.HermesPrefs
+import dev.wallner.hermesonglass.phone.data.rokid.SideloadEvent
 import dev.wallner.hermesonglass.phone.data.ws.ConnectionState
 import dev.wallner.hermesonglass.phone.domain.ChatUiState
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 
 data class SettingsUiState(
     val wsUrl: String,
@@ -20,20 +23,74 @@ data class SettingsUiState(
     val connectionState: ConnectionState,
 )
 
+/**
+ * UI state for the "Glasses app" section in Settings — drives the install
+ * status line and button enablement.
+ */
+sealed interface GlassesAppState {
+    data object Unknown : GlassesAppState
+    data object NotInstalled : GlassesAppState
+    data object Installed : GlassesAppState
+    data object Installing : GlassesAppState
+    data object Launching : GlassesAppState
+    data class Failed(val reason: String) : GlassesAppState
+}
+
 class SettingsViewModel(private val app: HermesApp) : ViewModel() {
 
     private val prefs: HermesPrefs get() = app.prefs
 
-    init {
-        // Sync the in-memory log toggle with persisted prefs at construction.
-        DebugEventLog.enabled = prefs.debugEventsEnabled
-    }
-
     private val _state = MutableStateFlow(snapshot(secretRevealed = false))
     val state: StateFlow<SettingsUiState> = _state.asStateFlow()
 
+    private val _glassesAppState = MutableStateFlow<GlassesAppState>(GlassesAppState.Unknown)
+    val glassesAppState: StateFlow<GlassesAppState> = _glassesAppState.asStateFlow()
+
+    val capsConnected: StateFlow<Boolean> get() = app.capsLink.connected
+
     val connectionState: StateFlow<ConnectionState> get() = app.repository.connectionState
     val chatState: StateFlow<ChatUiState> get() = app.repository.state
+
+    init {
+        // Sync the in-memory log toggle with persisted prefs at construction.
+        DebugEventLog.enabled = prefs.debugEventsEnabled
+
+        // Translate sideload events into UI state.
+        app.apkSideloader?.let { sideloader ->
+            viewModelScope.launch {
+                sideloader.events.collect { event ->
+                    when (event) {
+                        is SideloadEvent.QueryAppResult ->
+                            _glassesAppState.value =
+                                if (event.installed) GlassesAppState.Installed
+                                else GlassesAppState.NotInstalled
+                        SideloadEvent.InstallSucceeded ->
+                            _glassesAppState.value = GlassesAppState.Launching
+                        SideloadEvent.InstallFailed ->
+                            _glassesAppState.value = GlassesAppState.Failed("install failed")
+                        SideloadEvent.OpenAppSucceeded ->
+                            _glassesAppState.value = GlassesAppState.Installed
+                        SideloadEvent.OpenAppFailed ->
+                            _glassesAppState.value = GlassesAppState.Failed("launch failed")
+                        SideloadEvent.UninstallSucceeded,
+                        SideloadEvent.UninstallFailed,
+                        is SideloadEvent.StopAppResult,
+                        is SideloadEvent.GlassAppResume -> Unit
+                    }
+                }
+            }
+        }
+
+        // Auto-query glasses-app install status the first time the link comes
+        // up. Subsequent transitions are user-driven via [triggerInstall].
+        viewModelScope.launch {
+            app.capsLink.connected.collect { connected ->
+                if (connected && _glassesAppState.value is GlassesAppState.Unknown) {
+                    queryGlassesApp()
+                }
+            }
+        }
+    }
 
     /**
      * Rename a session via the same `slash_command` channel the glasses
@@ -73,6 +130,25 @@ class SettingsViewModel(private val app: HermesApp) : ViewModel() {
 
     fun applyAndReconnect() {
         app.rebuildRepository()
+    }
+
+    /** Query whether the glasses-app is already installed on the glasses. */
+    fun queryGlassesApp() {
+        val sideloader = app.apkSideloader ?: run {
+            _glassesAppState.value = GlassesAppState.Failed("authorize Hi Rokid first")
+            return
+        }
+        sideloader.queryInstalled()
+    }
+
+    /** Stage and install the bundled glasses APK, then auto-launch it. */
+    fun triggerInstall() {
+        val sideloader = app.apkSideloader ?: run {
+            _glassesAppState.value = GlassesAppState.Failed("authorize Hi Rokid first")
+            return
+        }
+        _glassesAppState.value = GlassesAppState.Installing
+        sideloader.installAndLaunch()
     }
 
     private fun snapshot(secretRevealed: Boolean): SettingsUiState = SettingsUiState(
