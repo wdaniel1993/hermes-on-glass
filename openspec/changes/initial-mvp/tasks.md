@@ -34,7 +34,7 @@
 
 - [x] 4.1 Create root `build.gradle.kts`, `settings.gradle.kts`, `gradle.properties`, gradle wrapper
 - [x] 4.2 Add three modules: `shared/`, `phone-app/`, `glasses-app/`
-- [x] 4.3 Configure Maven repo `https://maven.rokid.com/repository/maven-public/` and depend on `com.rokid.cxr:client-m:<pinned>` (phone), `com.rokid.cxr:cxr-service-bridge:<pinned>` (glasses CXR-S), and the CXR-L AIDL bindings (glasses) *(pinned `client-m:1.2.1`, `client-l:1.0.1`. Glasses uses `client-l` only — that AAR ships the CXR-S service bridge classes (CXRServiceBridge, Caps, ...) AND CXR-L media APIs in one artifact, so adding `cxr-service-bridge:1.0` alongside produced duplicate-class errors at d8.)*
+- [x] 4.3 Configure Maven repo `https://maven.rokid.com/repository/maven-public/` and depend on `com.rokid.cxr:client-m:<pinned>` (phone), `com.rokid.cxr:cxr-service-bridge:<pinned>` (glasses CXR-S), and the CXR-L AIDL bindings (glasses) *(SUPERSEDED by `openspec/changes/cxr-l-phone-migration/` — Rokid decommissioned CXR-M on 2026-05-15. Phone now uses `client-l:1.0.1` (CXR-L Hi Rokid app extension); glasses keep `client-l:1.0.1` (CXR-S bridge + media APIs in one AAR).)*
 - [x] 4.4 Wire `phone-app:preBuild` to a `bundleGlassesApk` task that copies `glasses-app-debug.apk` into `phone-app/src/main/assets/glasses-app-release.apk`
 - [x] 4.5 Add `local.properties` template documenting `rokid.clientId`, `rokid.clientSecret`, `rokid.accessKey`; inject via `BuildConfig`
 - [x] 4.6 Set up `.gitignore` for `local.properties`, build outputs, IDE metadata

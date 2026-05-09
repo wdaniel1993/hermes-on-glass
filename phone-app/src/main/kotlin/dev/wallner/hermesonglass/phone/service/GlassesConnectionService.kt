@@ -11,7 +11,6 @@ import android.os.Build
 import android.os.IBinder
 import dev.wallner.hermesonglass.phone.HermesApp
 import dev.wallner.hermesonglass.phone.MainActivity
-import dev.wallner.hermesonglass.phone.data.rokid.GlassesConnectionState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -21,19 +20,13 @@ import kotlinx.coroutines.launch
 import timber.log.Timber
 
 /**
- * Owns the glasses connection lifecycle in the foreground so the OS doesn't
- * kill it under Doze / aggressive memory pressure. Holds:
- *   - the [GlassesConnectionManager] (BLE pairing + reconnect)
- *   - the [PhoneToGlassesBridge] (WS <-> Caps translation)
+ * Owns the glasses-link lifecycle in the foreground so the OS doesn't kill
+ * it under Doze / aggressive memory pressure. Holds the WS↔Caps bridge and
+ * watches `CapsLink.connected` to keep the persistent notification text in
+ * sync.
  *
- * The notification copy follows OQ6: a one-line status that reflects the
- * live connection state. Real UX-reviewed copy lands in §13.2; for MVP we
- * use a clear technical status.
- *
- * Lifecycle entry points:
- *   - [start] / [stop] from the activity (uses startForegroundService).
- *   - System restart pulls the [HermesApp] singleton again, so all wiring
- *     is centralised there; this service is a thin lifecycle holder.
+ * Hi Rokid AI app handles BLE pairing for us — there is no pair/reconnect
+ * state machine on this side anymore.
  */
 class GlassesConnectionService : Service() {
 
@@ -45,10 +38,12 @@ class GlassesConnectionService : Service() {
         ensureChannel(this)
         startForeground(NOTIFICATION_ID, buildNotification(initialStateText()))
         val app = application as HermesApp
-        app.glassesConnection.start()
+        app.capsLink.start()
         app.phoneToGlassesBridge.start()
         stateJob = scope.launch {
-            app.glassesConnection.state.collect { updateNotification(describe(it)) }
+            app.capsLink.connected.collect { connected ->
+                updateNotification(if (connected) "Glasses connected" else "Glasses offline — retrying")
+            }
         }
         Timber.i("GlassesConnectionService started")
     }
@@ -62,26 +57,11 @@ class GlassesConnectionService : Service() {
         scope.cancel()
         val app = application as HermesApp
         app.phoneToGlassesBridge.stop()
-        app.glassesConnection.stop()
+        app.capsLink.stop()
         super.onDestroy()
     }
 
-    // Notification copy for the persistent foreground service. Short, no
-    // jargon, no decorative emoji — Android compresses these on the lock
-    // screen and most users glance at them as status, not for actions.
-    // Resolves OQ6.
     private fun initialStateText(): String = "Connecting…"
-
-    private fun describe(state: GlassesConnectionState): String = when (state) {
-        GlassesConnectionState.Idle -> "Ready"
-        GlassesConnectionState.Pairing -> "Pairing glasses…"
-        GlassesConnectionState.Connecting -> "Connecting…"
-        is GlassesConnectionState.Connected ->
-            state.deviceName?.takeIf { it.isNotBlank() }?.let { "Glasses: $it" }
-                ?: "Glasses connected"
-        GlassesConnectionState.Disconnected -> "Glasses offline — retrying"
-        is GlassesConnectionState.Failed -> "Glasses unreachable — retrying"
-    }
 
     private fun updateNotification(text: String) {
         val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager

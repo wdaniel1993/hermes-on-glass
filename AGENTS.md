@@ -64,11 +64,12 @@ Modules don't exist yet — scaffolded by `tasks.md`.
 
 ## Local setup
 
-- `local.properties` (gitignored): `rokid.clientId`, `rokid.clientSecret`, `rokid.accessKey`.
+- `local.properties` (gitignored): no Rokid build-time secrets needed. Phone↔glasses auth is runtime via Hi Rokid AI app (`AuthorizationHelper`); see `openspec/changes/cxr-l-phone-migration/` for context.
+- Hi Rokid AI app installed on the phone (`com.rokid.sprite.aiapp`); user grants authorization on first launch, token persisted in EncryptedSharedPreferences.
 - `~/.hermes/plugins/hermes-channel-adapter/config.yaml`: `listen_host`, `listen_port`, `shared_secret`.
 - Hermes voice config (already on Mac mini): `~/.hermes/config.yaml` `tts.provider`, `stt.provider`, `voice.auto_tts`.
 - Tailscale up on both ends; MagicDNS resolves `mac` to the Mac mini.
-- Phone stores the shared secret in EncryptedSharedPreferences. Never commit it.
+- Phone stores the Hermes shared secret + Hi Rokid auth token in EncryptedSharedPreferences. Never commit either.
 
 ## Conventions
 

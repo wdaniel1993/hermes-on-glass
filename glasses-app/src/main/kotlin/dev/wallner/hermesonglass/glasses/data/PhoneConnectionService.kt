@@ -25,7 +25,8 @@ import timber.log.Timber
  */
 class PhoneConnectionService(
     private val bridge: CXRServiceBridge = CXRServiceBridge(),
-    private val topic: String = DEFAULT_TOPIC,
+    private val inboundChannel: String = PHONE_TO_GLASSES_CHANNEL,
+    private val outboundChannel: String = GLASSES_TO_PHONE_CHANNEL,
     private val gson: Gson = Gson(),
 ) : PhoneLink {
     private val _envelopes = MutableSharedFlow<CapsEnvelope>(extraBufferCapacity = 64)
@@ -35,9 +36,9 @@ class PhoneConnectionService(
     override val connected: StateFlow<Boolean> = _connected.asStateFlow()
 
     override fun start() {
-        val rc = bridge.subscribe(topic, callback)
+        val rc = bridge.subscribe(inboundChannel, callback)
         if (rc != 0) {
-            Timber.w("CXRServiceBridge.subscribe('%s') returned %d", topic, rc)
+            Timber.w("CXRServiceBridge.subscribe('%s') returned %d", inboundChannel, rc)
         }
         bridge.setStatusListener(statusListener)
     }
@@ -51,7 +52,7 @@ class PhoneConnectionService(
     override fun send(envelope: CapsEnvelope): Boolean {
         val caps = Caps()
         caps.write(gson.toJson(envelope))
-        val rc = bridge.sendMessage(topic, caps)
+        val rc = bridge.sendMessage(outboundChannel, caps)
         if (rc != 0) {
             Timber.w("CXRServiceBridge.sendMessage rc=%d for %s", rc, envelope.type)
         }
@@ -110,6 +111,12 @@ class PhoneConnectionService(
     }
 
     companion object {
-        const val DEFAULT_TOPIC: String = "hermes-on-glass"
+        // CXR-L on phone splits send/receive into separate channels; we mirror
+        // the same names on this side. Phone calls
+        // `cxrLink.sendCustomCmd(PHONE_TO_GLASSES_CHANNEL, ...)`; we subscribe.
+        // We send via `sendMessage(GLASSES_TO_PHONE_CHANNEL, caps)`; the phone's
+        // `setCXRCustomCmdCbk` filters on the same name.
+        const val PHONE_TO_GLASSES_CHANNEL: String = "hermes-on-glass"
+        const val GLASSES_TO_PHONE_CHANNEL: String = "hermes-on-glass-reply"
     }
 }

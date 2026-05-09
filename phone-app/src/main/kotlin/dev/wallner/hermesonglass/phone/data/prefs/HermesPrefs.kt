@@ -54,6 +54,15 @@ class HermesPrefs(context: Context) {
             secret.edit().putString(KEY_SECRET, value).apply()
         }
 
+    /** Auth token from Hi Rokid's `AuthorizationHelper`, used by `CXRLink.connect(token)`. */
+    var rokidAuthToken: String
+        get() = secret.getString(KEY_ROKID_TOKEN, "") ?: ""
+        set(value) {
+            secret.edit().putString(KEY_ROKID_TOKEN, value).apply()
+        }
+
+    fun hasRokidAuthToken(): Boolean = rokidAuthToken.isNotEmpty()
+
     /**
      * One-shot flag set after the user has seen the battery-optimization
      * exemption prompt — we don't want to nag every launch.
@@ -74,6 +83,7 @@ class HermesPrefs(context: Context) {
         private const val KEY_DEBUG = "debug_events"
         private const val KEY_DEVICE_ID = "device_id"
         private const val KEY_SECRET = "shared_secret"
+        private const val KEY_ROKID_TOKEN = "rokid_auth_token"
         private const val KEY_BATTERY_PROMPTED = "battery_prompted"
     }
 }

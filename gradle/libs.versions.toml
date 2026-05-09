@@ -15,9 +15,8 @@ turbine = "1.2.0"
 javaWebsocket = "1.5.7"
 
 # Rokid CXR — coordinates verified at maven-public on 2026-05-06.
-# Phone uses CXR-M; glasses use CXR-S (cxr-service-bridge) + CXR-L (client-l).
-rokidCxrM = "1.2.1"
-rokidCxrServiceBridge = "1.0"
+# Both phone and glasses use client-l: phone uses CXR-L (Hi Rokid app extension),
+# glasses use CXR-S service bridge classes which are bundled in the same AAR.
 rokidCxrL = "1.0.1"
 
 [libraries]
@@ -37,8 +36,6 @@ compose-ui-tooling = { module = "androidx.compose.ui:ui-tooling" }
 compose-ui-tooling-preview = { module = "androidx.compose.ui:ui-tooling-preview" }
 compose-material3 = { module = "androidx.compose.material3:material3" }
 
-rokid-cxr-m = { module = "com.rokid.cxr:client-m", version.ref = "rokidCxrM" }
-rokid-cxr-service-bridge = { module = "com.rokid.cxr:cxr-service-bridge", version.ref = "rokidCxrServiceBridge" }
 rokid-cxr-l = { module = "com.rokid.cxr:client-l", version.ref = "rokidCxrL" }
 
 junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junitJupiter" }

@@ -72,34 +72,29 @@ the URL differs. The protocol is plain `ws://`, not `wss://`; security
 relies on the network being trusted (Tailscale's WireGuard tunnel or
 private LAN).
 
-## §13.5 — Rokid SDK credentials
+## §13.5 — Hi Rokid AI app + authorization
 
-The phone-app reads three values from `local.properties` at build time
-(see `local.properties.template` for the keys). They land as
-`BuildConfig` fields in the phone-app only.
+The phone-app no longer takes any Rokid build-time secrets. Phone↔glasses
+auth runs at runtime through the **Hi Rokid AI app** (`com.rokid.sprite.aiapp`):
 
-```properties
-rokid.clientId=<from-rokid-developer-console>
-rokid.clientSecret=<from-rokid-developer-console>
-rokid.accessKey=<from-rokid-developer-console>
-```
+1. Install Hi Rokid AI app on the phone from the Play Store. The phone-app
+   surfaces an "Install Hi Rokid" button on first launch if it's missing.
+2. Pair Rokid Glasses through Hi Rokid (Hi Rokid owns BLE pairing now —
+   our app no longer ships pairing UI).
+3. Launch the phone-app. On first run it asks for authorization; tap
+   "Authorize" to invoke `AuthorizationHelper.requestAuthorization(...)`
+   in the Hi Rokid app. The returned token is persisted in
+   `EncryptedSharedPreferences` and fed to `CXRLink.connect(token)` on
+   subsequent launches.
 
-How to obtain them:
+The glasses-app side still needs the same Hi Rokid AI app installed at
+versionCode ≥ 100000 — this is enforced by `CxrLBootstrap.checkRequirements`.
 
-1. Sign in at the Rokid developer console.
-2. Create an application bound to the package name `dev.wallner.hermesonglass.phone`.
-3. The console issues the three values; copy them into `local.properties`.
-4. Rebuild the phone-app — `BuildConfig.ROKID_CLIENT_ID`,
-   `BuildConfig.ROKID_CLIENT_SECRET`, and `BuildConfig.ROKID_ACCESS_KEY`
-   are now baked into the APK.
-
-`local.properties` is gitignored and must not be committed. Use
-`local.properties.template` as the canonical reference; do not check in
-real credentials.
-
-The shared secret used by `CxrApi.connectBluetooth(...)` for SN
-verification is `rokid.clientSecret`. Glasses-app needs the same Rokid AI
-app installed at versionCode ≥ 100000 to authorise CXR-L.
+This replaces the previous CXR-M flow which read `rokid.clientId`,
+`rokid.clientSecret`, `rokid.accessKey` from `local.properties` and AES-
+decrypted the Bluetooth SN handshake. CXR-M was decommissioned by Rokid
+on 2026-05-15. See `openspec/changes/cxr-l-phone-migration/` for the full
+migration record.
 
 ## §13.6 — Channel adapter install
 

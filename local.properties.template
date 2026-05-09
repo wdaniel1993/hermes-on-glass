@@ -5,10 +5,6 @@
 # Override here if your SDK lives somewhere unusual.
 # sdk.dir=/Users/<you>/Library/Android/sdk
 
-# Rokid CXR-M credentials — required by phone-app at runtime to discover
-# and pair with Rokid Glasses. Issued via the Rokid developer console;
-# bound to your application package name. Injected into BuildConfig at
-# build time (phone-app only).
-rokid.clientId=
-rokid.clientSecret=
-rokid.accessKey=
+# No Rokid build-time secrets are required: phone↔glasses auth is handled
+# at runtime by the Hi Rokid AI app via AuthorizationHelper, which returns
+# a token the user grants on first launch.

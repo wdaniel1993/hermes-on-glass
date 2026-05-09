@@ -2,7 +2,9 @@ package dev.wallner.hermesonglass.phone.data.cxr
 
 import com.google.gson.Gson
 import com.rokid.cxr.Caps
-import com.rokid.cxr.CXRServiceBridge
+import com.rokid.cxr.link.CXRLink
+import com.rokid.cxr.link.callbacks.ICXRLinkCbk
+import com.rokid.cxr.link.callbacks.ICustomCmdCbk
 import dev.wallner.hermesonglass.phone.data.debug.DebugEventLog
 import dev.wallner.hermesonglass.shared.CapsEnvelope
 import dev.wallner.hermesonglass.shared.FrameParser
@@ -15,18 +17,23 @@ import kotlinx.coroutines.flow.asStateFlow
 import timber.log.Timber
 
 /**
- * Phone-side production [CapsLink]. Mirrors the glasses-app's
- * `PhoneConnectionService`: subscribes to a single topic, decodes the
- * leading string Value into a typed [CapsEnvelope] via [FrameParser],
- * and sends outbound envelopes by encoding to JSON and writing into a
- * one-string [Caps] payload via `sendMessage`.
+ * Phone-side production [CapsLink] over Rokid CXR-L (Hi Rokid AI app extension).
  *
- * Bulk media (audio chunks, image bytes) goes through [CXRServiceBridge.startAudioStream]
- * / `sendStream` instead and stays out of this control-plane channel.
+ * Wire shape (D17 in `cxr-l-phone-migration/design.md`):
+ *  - Phone → glasses: `cxrLink.sendCustomCmd(PHONE_TO_GLASSES_CHANNEL, caps.serialize())`
+ *  - Glasses → phone: `setCXRCustomCmdCbk { onCustomCmdResult(key, payload) }`
+ *    filtered to `key == GLASSES_TO_PHONE_CHANNEL`, decoded via `Caps.fromBytes(...)`.
+ *
+ * Connection state is `onCXRLConnected && onGlassBtConnected` — both the
+ * CXR transport AND the BLE link to glasses (managed by Hi Rokid) must be up.
+ *
+ * The `CXRLink` itself is constructed once at Application scope so its
+ * callbacks survive Activity destruction; this class wraps it and exposes
+ * the platform-agnostic [CapsLink] surface.
  */
 class CxrCapsLink(
-    private val bridge: CXRServiceBridge = CXRServiceBridge(),
-    private val topic: String = DEFAULT_TOPIC,
+    private val cxrLink: CXRLink,
+    private val token: String,
     private val gson: Gson = Gson(),
 ) : CapsLink {
 
@@ -36,14 +43,61 @@ class CxrCapsLink(
     private val _connected = MutableStateFlow(false)
     override val connected: StateFlow<Boolean> = _connected.asStateFlow()
 
+    private var cxrUp: Boolean = false
+    private var btUp: Boolean = false
+
+    private val linkCallback = object : ICXRLinkCbk {
+        override fun onCXRLConnected(connected: Boolean) {
+            cxrUp = connected
+            updateConnected()
+        }
+        override fun onGlassBtConnected(connected: Boolean) {
+            btUp = connected
+            updateConnected()
+        }
+        override fun onGlassAiAssistStart() = Unit
+        override fun onGlassAiAssistStop() = Unit
+    }
+
+    private val cmdCallback = object : ICustomCmdCbk {
+        override fun onCustomCmdResult(key: String?, payload: ByteArray?) {
+            if (key != GLASSES_TO_PHONE_CHANNEL) return
+            val caps = payload?.let { runCatching { Caps.fromBytes(it) }.getOrNull() } ?: return
+            try {
+                val json = if (caps.size() > 0) runCatching { caps.at(0)?.string }.getOrNull() else null
+                if (json == null) {
+                    Timber.d("caps payload on '%s' had no leading string", key)
+                    return
+                }
+                val parsed = FrameParser.parseCapsEnvelope(json)
+                if (parsed != null) {
+                    DebugEventLog.record(
+                        DebugEventLog.Direction.IN, DebugEventLog.Wire.CAPS,
+                        parsed.type, json,
+                    )
+                    _inbound.tryEmit(parsed)
+                } else {
+                    Timber.d("dropping unrecognised caps payload on '%s'", key)
+                }
+            } catch (e: Throwable) {
+                Timber.w(e, "caps decode failed on '%s'", key)
+            }
+        }
+    }
+
     override fun start() {
-        val rc = bridge.subscribe(topic, callback)
-        if (rc != 0) Timber.w("CXRServiceBridge.subscribe('%s') returned %d", topic, rc)
-        bridge.setStatusListener(statusListener)
+        cxrLink.setCXRLinkCbk(linkCallback)
+        cxrLink.setCXRCustomCmdCbk(cmdCallback)
+        cxrLink.connect(token)
     }
 
     override fun stop() {
-        bridge.setStatusListener(null)
+        // CXR-L exposes no documented disconnect hook; the link is held at
+        // Application scope and outlives this wrapper. Drop our callbacks so
+        // a re-`start()` re-installs them cleanly.
+        cxrUp = false
+        btUp = false
+        updateConnected()
     }
 
     override fun send(envelope: CapsEnvelope): Boolean {
@@ -57,53 +111,21 @@ class CxrCapsLink(
         DebugEventLog.record(DebugEventLog.Direction.OUT, DebugEventLog.Wire.CAPS, envelope.type, json)
         val caps = Caps()
         caps.write(json)
-        val rc = bridge.sendMessage(topic, caps)
-        if (rc != 0) Timber.w("CXRServiceBridge.sendMessage rc=%d", rc)
-        return rc == 0
+        return runCatching {
+            cxrLink.sendCustomCmd(PHONE_TO_GLASSES_CHANNEL, caps.serialize())
+            true
+        }.getOrElse {
+            Timber.w(it, "CXRLink.sendCustomCmd threw")
+            false
+        }
     }
 
-    private val statusListener = object : CXRServiceBridge.StatusListener {
-        override fun onConnected(deviceId: String?, name: String?, deviceType: Int) {
-            _connected.value = true
-        }
-        override fun onConnecting(deviceId: String?, name: String?, deviceType: Int) = Unit
-        override fun onDisconnected() { _connected.value = false }
-        override fun onARTCStatus(quality: Float, isReady: Boolean) = Unit
-        override fun onRokidAccountChanged(accountId: String?) = Unit
-    }
-
-    private val callback = object : CXRServiceBridge.MsgReplyCallback {
-        override fun onReceive(
-            name: String,
-            msg: Caps,
-            extra: ByteArray?,
-            reply: CXRServiceBridge.Reply,
-        ) {
-            try {
-                val json = if (msg.size() > 0) runCatching { msg.at(0)?.string }.getOrNull() else null
-                if (json != null) {
-                    val parsed = FrameParser.parseCapsEnvelope(json)
-                    if (parsed != null) {
-                        DebugEventLog.record(
-                            DebugEventLog.Direction.IN, DebugEventLog.Wire.CAPS,
-                            parsed.type, json,
-                        )
-                        _inbound.tryEmit(parsed)
-                    } else {
-                        Timber.d("dropping unrecognised caps payload on '%s'", name)
-                    }
-                } else {
-                    Timber.d("caps payload on '%s' had no leading string", name)
-                }
-            } catch (e: Throwable) {
-                Timber.w(e, "caps decode failed on '%s'", name)
-            } finally {
-                runCatching { reply.end(Caps()) }
-            }
-        }
+    private fun updateConnected() {
+        _connected.value = cxrUp && btUp
     }
 
     companion object {
-        const val DEFAULT_TOPIC: String = "hermes-on-glass"
+        const val PHONE_TO_GLASSES_CHANNEL: String = "hermes-on-glass"
+        const val GLASSES_TO_PHONE_CHANNEL: String = "hermes-on-glass-reply"
     }
 }

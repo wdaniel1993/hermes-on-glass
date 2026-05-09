@@ -1,17 +1,8 @@
-import java.util.Properties
-
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
 }
-
-val rokid: Properties = Properties().apply {
-    val f = rootProject.file("local.properties")
-    if (f.exists()) f.inputStream().use { load(it) }
-}
-
-fun rokidProp(key: String): String = rokid.getProperty(key, "")
 
 android {
     namespace = "dev.wallner.hermesonglass.phone"
@@ -27,10 +18,6 @@ android {
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
-
-        buildConfigField("String", "ROKID_CLIENT_ID", "\"${rokidProp("rokid.clientId")}\"")
-        buildConfigField("String", "ROKID_CLIENT_SECRET", "\"${rokidProp("rokid.clientSecret")}\"")
-        buildConfigField("String", "ROKID_ACCESS_KEY", "\"${rokidProp("rokid.accessKey")}\"")
     }
 
     buildFeatures {
@@ -85,7 +72,7 @@ dependencies {
     implementation(libs.okhttp)
     implementation(libs.timber)
 
-    implementation(libs.rokid.cxr.m)
+    implementation(libs.rokid.cxr.l)
 
     debugImplementation(libs.java.websocket)
 

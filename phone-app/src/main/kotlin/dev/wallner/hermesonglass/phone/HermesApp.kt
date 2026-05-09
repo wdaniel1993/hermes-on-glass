@@ -1,16 +1,15 @@
 package dev.wallner.hermesonglass.phone
 
 import android.app.Application
+import com.rokid.cxr.link.CXRLink
+import com.rokid.cxr.link.utils.CxrDefs
 import dev.wallner.hermesonglass.phone.data.cxr.CapsLink
 import dev.wallner.hermesonglass.phone.data.cxr.CxrCapsLink
-import dev.wallner.hermesonglass.phone.debug.createEmulatorCapsLinkOrNull
 import dev.wallner.hermesonglass.phone.data.prefs.HermesPrefs
-import dev.wallner.hermesonglass.phone.data.rokid.EncryptedSnStore
-import dev.wallner.hermesonglass.phone.data.rokid.GlassesConnectionManager
-import dev.wallner.hermesonglass.phone.data.rokid.RokidSdkClient
-import dev.wallner.hermesonglass.phone.data.rokid.RokidSdkManager
-import dev.wallner.hermesonglass.phone.data.rokid.SnStore
+import dev.wallner.hermesonglass.phone.data.rokid.ApkSideloader
+import dev.wallner.hermesonglass.phone.data.rokid.CxrApkSideloader
 import dev.wallner.hermesonglass.phone.data.ws.HermesWsClient
+import dev.wallner.hermesonglass.phone.debug.createEmulatorCapsLinkOrNull
 import dev.wallner.hermesonglass.phone.domain.ChatRepository
 import dev.wallner.hermesonglass.phone.domain.PhoneToGlassesBridge
 import dev.wallner.hermesonglass.phone.domain.WakeSignalManager
@@ -18,31 +17,45 @@ import timber.log.Timber
 import java.util.UUID
 
 /**
- * Application root. Lazily constructs the prefs store, the chat repository,
- * the Rokid CXR-M connection manager, and the WS<->Caps bridge.
+ * Application root. Lazily constructs the prefs store, the CXR-L session, the
+ * chat repository, the apk sideloader, and the WS↔Caps bridge.
+ *
+ * The CXR-L session ([CXRLink]) is App-scoped per the sample's
+ * `CXRLSampleApplication.sharedCxrLink` pattern so its callbacks survive
+ * Activity destruction.
  *
  * Reconfiguring (e.g. user edits the URL or shared secret) tears the WS
- * client down and constructs a new one via [rebuildRepository]. The Rokid
- * connection manager is independent of the WS — it survives WS rebuilds —
- * so we don't tear it down here.
+ * client down and constructs a new one via [rebuildRepository]. The CXR-L
+ * link is independent of the WS — it survives WS rebuilds — so we don't tear
+ * it down here.
  */
 class HermesApp : Application() {
 
     val prefs: HermesPrefs by lazy { HermesPrefs(this) }
-    val snStore: SnStore by lazy { EncryptedSnStore(this) }
-    val rokidSdkClient: RokidSdkClient by lazy { RokidSdkManager(this) }
-    val glassesConnection: GlassesConnectionManager by lazy {
-        GlassesConnectionManager(
-            sdk = rokidSdkClient,
-            snStore = snStore,
-            clientSecret = BuildConfig.ROKID_CLIENT_SECRET,
-        )
+
+    val cxrLink: CXRLink? by lazy {
+        if (!prefs.hasRokidAuthToken()) return@lazy null
+        CXRLink(this).apply {
+            configCXRSession(
+                CxrDefs.CXRSession(
+                    CxrDefs.CXRSessionType.CUSTOMAPP,
+                    CxrApkSideloader.GLASSES_PACKAGE_NAME,
+                ),
+            )
+        }
     }
+
     val capsLink: CapsLink by lazy {
         // Debug + emulator variant: WebSocket bridge so emulator-only dev
         // loops work without a Bluetooth radio. Release builds always use
-        // the real CXR-S link.
-        createEmulatorCapsLinkOrNull() ?: CxrCapsLink()
+        // the real CXR-L link.
+        createEmulatorCapsLinkOrNull()
+            ?: cxrLink?.let { CxrCapsLink(it, prefs.rokidAuthToken) }
+            ?: NullCapsLink
+    }
+
+    val apkSideloader: ApkSideloader? by lazy {
+        cxrLink?.let { CxrApkSideloader(this, it) }
     }
 
     @Volatile private var _repository: ChatRepository? = null
@@ -64,10 +77,6 @@ class HermesApp : Application() {
         if (prefs.deviceId.isEmpty()) {
             prefs.deviceId = "phone-" + UUID.randomUUID().toString().take(8)
         }
-        // If the user has already configured Hermes, kick the WS+bridge+wake
-        // stack immediately so we're not waiting on the chat screen to be
-        // touched. The getter triggers rebuildRepository() which starts each
-        // component if prefs are present.
         if (prefs.hasSharedSecret() && prefs.hermesWsUrl.isNotBlank()) {
             repository
         }
@@ -77,7 +86,7 @@ class HermesApp : Application() {
      * Construct (or reconstruct) the chat repository against the *current*
      * prefs values. Call after the user changes the URL or shared secret in
      * Settings; the old WS connection is dropped and a new one starts.
-     * Also rebuilds the WS<->Caps bridge so it points at the new client.
+     * Also rebuilds the WS↔Caps bridge so it points at the new client.
      */
     @Synchronized
     fun rebuildRepository(): ChatRepository {
@@ -107,4 +116,17 @@ class HermesApp : Application() {
         rebuildRepository()
         return _bridge!!
     }
+}
+
+/**
+ * Stand-in [CapsLink] used when no auth token is persisted yet — the
+ * connection bits exist on screen but cannot dial out. Once the user
+ * completes Hi Rokid authorization, [HermesApp.capsLink] gets re-resolved.
+ */
+private object NullCapsLink : CapsLink {
+    override val inbound = kotlinx.coroutines.flow.MutableSharedFlow<dev.wallner.hermesonglass.shared.CapsEnvelope>()
+    override val connected = kotlinx.coroutines.flow.MutableStateFlow(false)
+    override fun start() = Unit
+    override fun stop() = Unit
+    override fun send(envelope: dev.wallner.hermesonglass.shared.CapsEnvelope): Boolean = false
 }
