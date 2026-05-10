@@ -49,9 +49,20 @@ class GlassesApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
-        if (BuildConfig.DEBUG) Timber.plant(Timber.DebugTree())
-        hudRepository.start()
-        voiceController.start()
-        photoCoordinator.start()
+        Timber.plant(Timber.DebugTree())
+        Timber.i("GlassesApp.onCreate — wiring repositories")
+        // Each start() can touch native libs, system services, or the
+        // CXR-S bridge. A throw from any of them used to take Application
+        // creation down with it (and therefore the launch icon). Guard each
+        // independently so the HUD still renders even if one subsystem can't
+        // initialise; the missing surface degrades to no-op rather than a
+        // crash on launch.
+        runCatching { hudRepository.start() }
+            .onFailure { Timber.e(it, "hudRepository.start() failed") }
+        runCatching { voiceController.start() }
+            .onFailure { Timber.e(it, "voiceController.start() failed") }
+        runCatching { photoCoordinator.start() }
+            .onFailure { Timber.e(it, "photoCoordinator.start() failed") }
+        Timber.i("GlassesApp.onCreate — done")
     }
 }
