@@ -1,6 +1,7 @@
 package dev.wallner.hermesonglass.phone.data.rokid
 
 import android.content.Context
+import android.net.wifi.WifiManager
 import com.rokid.cxr.link.CXRLink
 import com.rokid.cxr.link.callbacks.IGlassAppCbk
 import dev.wallner.hermesonglass.phone.data.rokid.SideloadEvent.InstallFailed
@@ -21,6 +22,7 @@ import java.io.File
 sealed interface SideloadEvent {
     data object InstallSucceeded : SideloadEvent
     data object InstallFailed : SideloadEvent
+    data class InstallPrecheckFailed(val reason: String) : SideloadEvent
     data object OpenAppSucceeded : SideloadEvent
     data object OpenAppFailed : SideloadEvent
     data object UninstallSucceeded : SideloadEvent
@@ -58,6 +60,14 @@ class CxrApkSideloader(
     override val events: SharedFlow<SideloadEvent> = _events.asSharedFlow()
 
     override fun installAndLaunch() {
+        if (!isWifiEnabled()) {
+            // Hi Rokid pushes the APK over a phone↔glasses Wi-Fi hotspot;
+            // without phone Wi-Fi the SDK logs `加入热点失败` ("failed to join
+            // hotspot") and onInstallAppResult fires false. RokidBrew pattern.
+            Timber.w("install precheck failed: phone Wi-Fi disabled")
+            _events.tryEmit(SideloadEvent.InstallPrecheckFailed("phone Wi-Fi is off — Hi Rokid needs it for the glasses hotspot"))
+            return
+        }
         val apk = stageBundledApk() ?: run {
             Timber.w("glasses APK asset missing; skipping install")
             _events.tryEmit(InstallFailed)
@@ -69,6 +79,11 @@ class CxrApkSideloader(
             Timber.w(it, "appUploadAndInstall threw for %s", apk.absolutePath)
             _events.tryEmit(InstallFailed)
         }
+    }
+
+    private fun isWifiEnabled(): Boolean {
+        val wifi = context.getSystemService(WifiManager::class.java) ?: return false
+        return wifi.isWifiEnabled
     }
 
     override fun queryInstalled() {

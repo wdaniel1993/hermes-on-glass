@@ -67,7 +67,9 @@ class SettingsViewModel(private val app: HermesApp) : ViewModel() {
                         SideloadEvent.InstallSucceeded ->
                             _glassesAppState.value = GlassesAppState.Launching
                         SideloadEvent.InstallFailed ->
-                            _glassesAppState.value = GlassesAppState.Failed("install failed")
+                            _glassesAppState.value = GlassesAppState.Failed("install failed — check phone Wi-Fi and that Hi Rokid sees the glasses")
+                        is SideloadEvent.InstallPrecheckFailed ->
+                            _glassesAppState.value = GlassesAppState.Failed(event.reason)
                         SideloadEvent.OpenAppSucceeded ->
                             _glassesAppState.value = GlassesAppState.Installed
                         SideloadEvent.OpenAppFailed ->
