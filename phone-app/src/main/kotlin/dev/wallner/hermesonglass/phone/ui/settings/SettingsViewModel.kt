@@ -33,6 +33,7 @@ sealed interface GlassesAppState {
     data object Installed : GlassesAppState
     data object Installing : GlassesAppState
     data object Launching : GlassesAppState
+    data object Uninstalling : GlassesAppState
     data class Failed(val reason: String) : GlassesAppState
 }
 
@@ -74,8 +75,10 @@ class SettingsViewModel(private val app: HermesApp) : ViewModel() {
                             _glassesAppState.value = GlassesAppState.Installed
                         SideloadEvent.OpenAppFailed ->
                             _glassesAppState.value = GlassesAppState.Failed("launch failed")
-                        SideloadEvent.UninstallSucceeded,
-                        SideloadEvent.UninstallFailed,
+                        SideloadEvent.UninstallSucceeded ->
+                            _glassesAppState.value = GlassesAppState.NotInstalled
+                        SideloadEvent.UninstallFailed ->
+                            _glassesAppState.value = GlassesAppState.Failed("uninstall failed")
                         is SideloadEvent.StopAppResult,
                         is SideloadEvent.GlassAppResume -> Unit
                     }
@@ -151,6 +154,16 @@ class SettingsViewModel(private val app: HermesApp) : ViewModel() {
         }
         _glassesAppState.value = GlassesAppState.Installing
         sideloader.installAndLaunch()
+    }
+
+    /** Uninstall the glasses-app from the glasses. */
+    fun triggerUninstall() {
+        val sideloader = app.apkSideloader ?: run {
+            _glassesAppState.value = GlassesAppState.Failed("authorize Hi Rokid first")
+            return
+        }
+        _glassesAppState.value = GlassesAppState.Uninstalling
+        sideloader.uninstall()
     }
 
     private fun snapshot(secretRevealed: Boolean): SettingsUiState = SettingsUiState(

@@ -38,6 +38,8 @@ interface ApkSideloader {
     fun installAndLaunch()
     /** Query whether the glasses-app is already installed (result on [events]). */
     fun queryInstalled()
+    /** Uninstall the glasses-app. Result on [events] as Uninstall(Succeeded|Failed). */
+    fun uninstall()
 }
 
 /**
@@ -81,14 +83,27 @@ class CxrApkSideloader(
         }
     }
 
-    private fun isWifiEnabled(): Boolean {
-        val wifi = context.getSystemService(WifiManager::class.java) ?: return false
-        return wifi.isWifiEnabled
+    private fun isWifiEnabled(): Boolean = runCatching {
+        val wifi = context.getSystemService(WifiManager::class.java) ?: return@runCatching false
+        wifi.isWifiEnabled
+    }.getOrElse {
+        Timber.w(it, "WifiManager.isWifiEnabled threw")
+        // Treat as enabled so we don't block the install on a permission glitch.
+        true
     }
 
     override fun queryInstalled() {
         runCatching { cxrLink.appIsInstalled(callback) }
             .onFailure { Timber.w(it, "appIsInstalled threw") }
+    }
+
+    override fun uninstall() {
+        Timber.i("appUninstall(%s)", glassesPackageName)
+        runCatching { cxrLink.appUninstall(callback) }
+            .onFailure {
+                Timber.w(it, "appUninstall threw")
+                _events.tryEmit(SideloadEvent.UninstallFailed)
+            }
     }
 
     /**

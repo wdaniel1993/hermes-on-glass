@@ -147,7 +147,9 @@ private fun GlassesAppSection(viewModel: SettingsViewModel) {
     Text("Glasses app", style = MaterialTheme.typography.titleSmall)
     Text(describe(state), style = MaterialTheme.typography.bodyMedium)
 
-    val busy = state is GlassesAppState.Installing || state is GlassesAppState.Launching
+    val busy = state is GlassesAppState.Installing ||
+        state is GlassesAppState.Launching ||
+        state is GlassesAppState.Uninstalling
     Button(
         onClick = viewModel::triggerInstall,
         enabled = capsConnected && !busy,
@@ -160,6 +162,13 @@ private fun GlassesAppSection(viewModel: SettingsViewModel) {
                 else -> "Install & launch glasses app"
             },
         )
+    }
+    Button(
+        onClick = viewModel::triggerUninstall,
+        enabled = capsConnected && !busy && state !is GlassesAppState.NotInstalled,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Text("Uninstall glasses app")
     }
     if (!capsConnected) {
         Text(
@@ -175,6 +184,7 @@ private fun describe(state: GlassesAppState): String = when (state) {
     GlassesAppState.Installed -> "Glasses app: installed"
     GlassesAppState.Installing -> "Glasses app: installing… (~30s on first push)"
     GlassesAppState.Launching -> "Glasses app: launching…"
+    GlassesAppState.Uninstalling -> "Glasses app: uninstalling…"
     is GlassesAppState.Failed -> "Glasses app: failed — ${state.reason}"
 }
 
