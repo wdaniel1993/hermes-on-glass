@@ -102,7 +102,12 @@ class CxrApkSideloader(
         override fun onInstallAppResult(ok: Boolean) {
             _events.tryEmit(if (ok) InstallSucceeded else InstallFailed)
             if (ok) {
-                val activityRef = "$glassesPackageName/$glassesMainActivity"
+                // The SDK expects the activity's fully-qualified class name as a
+                // single string (e.g. "com.example.app.MainActivity"), not the
+                // ComponentName "pkg/.Activity" format. Sample concatenates
+                // package + leading-dot relative path; we match.
+                val activityRef = glassesPackageName + glassesMainActivity
+                Timber.i("appStart(%s)", activityRef)
                 runCatching { cxrLink.appStart(activityRef, this) }
                     .onFailure { Timber.w(it, "appStart threw for %s", activityRef) }
             }

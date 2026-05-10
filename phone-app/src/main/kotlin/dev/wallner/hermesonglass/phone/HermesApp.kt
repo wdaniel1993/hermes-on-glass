@@ -79,7 +79,7 @@ class HermesApp : Application() {
             return synchronized(cxrLock) {
                 val again = _capsLink
                 if (again != null && again !== NullCapsLink) return@synchronized again
-                val link = cxrLink?.let { CxrCapsLink(it, prefs.rokidAuthToken) } ?: NullCapsLink
+                val link = cxrLink?.let { CxrCapsLink(this, it, prefs.rokidAuthToken) } ?: NullCapsLink
                 _capsLink = link
                 link
             }

@@ -1,11 +1,15 @@
 package dev.wallner.hermesonglass.phone.data.cxr
 
+import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
 import com.google.gson.Gson
 import com.rokid.cxr.Caps
 import com.rokid.cxr.link.CXRLink
 import com.rokid.cxr.link.callbacks.ICXRLinkCbk
 import com.rokid.cxr.link.callbacks.ICustomCmdCbk
 import dev.wallner.hermesonglass.phone.data.debug.DebugEventLog
+import dev.wallner.hermesonglass.phone.data.rokid.HiRokidPresence
 import dev.wallner.hermesonglass.shared.CapsEnvelope
 import dev.wallner.hermesonglass.shared.FrameParser
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -32,6 +36,7 @@ import timber.log.Timber
  * the platform-agnostic [CapsLink] surface.
  */
 class CxrCapsLink(
+    private val context: Context,
     private val cxrLink: CXRLink,
     private val token: String,
     private val gson: Gson = Gson(),
@@ -48,15 +53,21 @@ class CxrCapsLink(
 
     private val linkCallback = object : ICXRLinkCbk {
         override fun onCXRLConnected(connected: Boolean) {
+            Timber.i("CXRLink onCXRLConnected=%s", connected)
             cxrUp = connected
             updateConnected()
         }
         override fun onGlassBtConnected(connected: Boolean) {
+            Timber.i("CXRLink onGlassBtConnected=%s", connected)
             btUp = connected
             updateConnected()
         }
-        override fun onGlassAiAssistStart() = Unit
-        override fun onGlassAiAssistStop() = Unit
+        override fun onGlassAiAssistStart() {
+            Timber.d("CXRLink onGlassAiAssistStart")
+        }
+        override fun onGlassAiAssistStop() {
+            Timber.d("CXRLink onGlassAiAssistStop")
+        }
     }
 
     private val cmdCallback = object : ICustomCmdCbk {
@@ -86,10 +97,69 @@ class CxrCapsLink(
     }
 
     override fun start() {
+        Timber.i("CxrCapsLink.start() — registering cbks and binding (token len=%d)", token.length)
         cxrLink.setCXRLinkCbk(linkCallback)
         cxrLink.setCXRCustomCmdCbk(cmdCallback)
-        cxrLink.connect(token)
+        // Bypass the SDK's CXRLink.connect(token), which hardcodes
+        // setPackage("com.rokid.sprite.aiapp") and misses the global Hi Rokid
+        // build (com.rokid.sprite.global.aiapp). We bind to whichever package
+        // is installed ourselves, passing the token as an Intent extra. The
+        // SDK's internal ServiceConnection is reflected out so the bound
+        // service still reaches the SDK's onServiceConnected logic. Pattern
+        // verified against Anezium/RokidBrew which exercises the same SDK on
+        // the same global Hi Rokid build.
+        if (!bindHiRokidService()) {
+            Timber.w("Manual bind failed; falling back to SDK connect()")
+            runCatching { cxrLink.connect(token) }
+                .onFailure { Timber.w(it, "CXRLink.connect threw") }
+        }
     }
+
+    private fun bindHiRokidService(): Boolean {
+        val packageName = when {
+            isPackageInstalled(HiRokidPresence.PACKAGE_GLOBAL) -> HiRokidPresence.PACKAGE_GLOBAL
+            isPackageInstalled(HiRokidPresence.PACKAGE_CHINA) -> HiRokidPresence.PACKAGE_CHINA
+            else -> {
+                Timber.w("No Hi Rokid AI app installed")
+                return false
+            }
+        }
+        val sc = findServiceConnection(cxrLink) ?: run {
+            Timber.w("Could not reflect CXRLink ServiceConnection field")
+            return false
+        }
+        val intent = Intent(MEDIA_SERVICE_ACTION)
+            .setPackage(packageName)
+            .putExtra(AUTH_TOKEN_EXTRA, token)
+        val bound = runCatching {
+            context.bindService(intent, sc, Context.BIND_AUTO_CREATE)
+        }.getOrElse {
+            Timber.w(it, "manual bindService threw for %s", packageName)
+            false
+        }
+        Timber.i("manual bindService(%s) -> %s", packageName, bound)
+        return bound
+    }
+
+    private fun findServiceConnection(link: CXRLink): ServiceConnection? {
+        var type: Class<*>? = link.javaClass
+        while (type != null) {
+            val field = type.declaredFields.firstOrNull {
+                ServiceConnection::class.java.isAssignableFrom(it.type)
+            }
+            if (field != null) {
+                field.isAccessible = true
+                return field.get(link) as? ServiceConnection
+            }
+            type = type.superclass
+        }
+        return null
+    }
+
+    private fun isPackageInstalled(packageName: String): Boolean = runCatching {
+        context.packageManager.getPackageInfo(packageName, 0)
+        true
+    }.getOrElse { false }
 
     override fun stop() {
         // CXR-L exposes no documented disconnect hook; the link is held at
@@ -127,5 +197,7 @@ class CxrCapsLink(
     companion object {
         const val PHONE_TO_GLASSES_CHANNEL: String = "hermes-on-glass"
         const val GLASSES_TO_PHONE_CHANNEL: String = "hermes-on-glass-reply"
+        private const val MEDIA_SERVICE_ACTION = "com.rokid.sprite.aiapp.externalapp.MEDIA_STREAM_SERVICE"
+        private const val AUTH_TOKEN_EXTRA = "auth_token"
     }
 }

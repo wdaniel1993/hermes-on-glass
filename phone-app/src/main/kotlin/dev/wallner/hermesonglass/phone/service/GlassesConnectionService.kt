@@ -38,10 +38,13 @@ class GlassesConnectionService : Service() {
         ensureChannel(this)
         startForeground(NOTIFICATION_ID, buildNotification(initialStateText()))
         val app = application as HermesApp
-        app.capsLink.start()
+        val capsLink = app.capsLink
+        Timber.i("GlassesConnectionService onCreate — capsLink=%s", capsLink::class.simpleName)
+        capsLink.start()
         app.phoneToGlassesBridge.start()
         stateJob = scope.launch {
-            app.capsLink.connected.collect { connected ->
+            capsLink.connected.collect { connected ->
+                Timber.i("capsLink.connected -> %s", connected)
                 updateNotification(if (connected) "Glasses connected" else "Glasses offline — retrying")
             }
         }
