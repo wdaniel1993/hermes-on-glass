@@ -33,30 +33,70 @@ class HermesApp : Application() {
 
     val prefs: HermesPrefs by lazy { HermesPrefs(this) }
 
-    val cxrLink: CXRLink? by lazy {
-        if (!prefs.hasRokidAuthToken()) return@lazy null
-        CXRLink(this).apply {
-            configCXRSession(
-                CxrDefs.CXRSession(
-                    CxrDefs.CXRSessionType.CUSTOMAPP,
-                    CxrApkSideloader.GLASSES_PACKAGE_NAME,
-                ),
-            )
+    private val cxrLock = Any()
+    @Volatile private var _cxrLink: CXRLink? = null
+    @Volatile private var _capsLink: CapsLink? = null
+    @Volatile private var _apkSideloader: ApkSideloader? = null
+    @Volatile private var _emulatorCapsLink: CapsLink? = null
+
+    /**
+     * App-scoped CXR-L session. `null` until the user has completed Hi Rokid
+     * authorization (we need the token before constructing the link). Once
+     * built, it survives Activity destruction so callbacks keep firing while
+     * the phone screen is off.
+     */
+    val cxrLink: CXRLink?
+        get() {
+            if (!prefs.hasRokidAuthToken()) return null
+            return _cxrLink ?: synchronized(cxrLock) {
+                _cxrLink ?: CXRLink(this).apply {
+                    configCXRSession(
+                        CxrDefs.CXRSession(
+                            CxrDefs.CXRSessionType.CUSTOMAPP,
+                            CxrApkSideloader.GLASSES_PACKAGE_NAME,
+                        ),
+                    )
+                }.also { _cxrLink = it }
+            }
         }
-    }
 
-    val capsLink: CapsLink by lazy {
-        // Debug + emulator variant: WebSocket bridge so emulator-only dev
-        // loops work without a Bluetooth radio. Release builds always use
-        // the real CXR-L link.
-        createEmulatorCapsLinkOrNull()
-            ?: cxrLink?.let { CxrCapsLink(it, prefs.rokidAuthToken) }
-            ?: NullCapsLink
-    }
+    /**
+     * Phone↔glasses Caps wire. Falls back to a debug WebSocket bridge on
+     * emulators (no Bluetooth radio); becomes [NullCapsLink] only while no
+     * token is persisted.
+     *
+     * Re-evaluated on every access until a real impl is cached, so authorizing
+     * Hi Rokid mid-session promotes [NullCapsLink] to [CxrCapsLink] without
+     * needing to restart the process.
+     */
+    val capsLink: CapsLink
+        get() {
+            val emulator = _emulatorCapsLink
+                ?: createEmulatorCapsLinkOrNull()?.also { _emulatorCapsLink = it }
+            if (emulator != null) return emulator
+            val cached = _capsLink
+            if (cached != null && cached !== NullCapsLink) return cached
+            return synchronized(cxrLock) {
+                val again = _capsLink
+                if (again != null && again !== NullCapsLink) return@synchronized again
+                val link = cxrLink?.let { CxrCapsLink(it, prefs.rokidAuthToken) } ?: NullCapsLink
+                _capsLink = link
+                link
+            }
+        }
 
-    val apkSideloader: ApkSideloader? by lazy {
-        cxrLink?.let { CxrApkSideloader(this, it) }
-    }
+    /**
+     * Bundled glasses-APK sideloader. `null` until Hi Rokid auth completes.
+     */
+    val apkSideloader: ApkSideloader?
+        get() {
+            val cached = _apkSideloader
+            if (cached != null) return cached
+            return synchronized(cxrLock) {
+                _apkSideloader ?: cxrLink?.let { CxrApkSideloader(this, it) }
+                    ?.also { _apkSideloader = it }
+            }
+        }
 
     @Volatile private var _repository: ChatRepository? = null
     @Volatile private var _bridge: PhoneToGlassesBridge? = null

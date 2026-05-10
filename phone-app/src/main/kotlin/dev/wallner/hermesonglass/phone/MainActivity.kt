@@ -108,9 +108,15 @@ class MainActivity : ComponentActivity() {
             is AuthResult.AuthSuccess -> {
                 app.prefs.rokidAuthToken = result.token
                 hasToken = true
-                // Token changes the construction of cxrLink/capsLink — rebuild the
-                // WS↔Caps stack so it picks up the new auth.
+                // Token unlocks construction of cxrLink/capsLink. Rebuild the
+                // WS↔Caps stack so the bridges hold the real CapsLink, then
+                // restart the foreground service so its `capsLink.start()`
+                // and `connected.collect` re-bind to the live instance
+                // (the old service was holding a NullCapsLink reference
+                // because it started before auth completed).
                 app.rebuildRepository()
+                GlassesConnectionService.stop(this@MainActivity)
+                GlassesConnectionService.start(this@MainActivity)
                 Timber.i("Hi Rokid authorization succeeded")
             }
             is AuthResult.AuthFail -> Timber.w("Hi Rokid authorization failed")

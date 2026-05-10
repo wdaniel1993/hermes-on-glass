@@ -163,7 +163,7 @@ private fun GlassesAppSection(viewModel: SettingsViewModel) {
     }
     if (!capsConnected) {
         Text(
-            "Connect to Hermes first.",
+            "Glasses link not connected — pair your glasses through Hi Rokid first.",
             style = MaterialTheme.typography.bodySmall,
         )
     }
